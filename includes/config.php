@@ -7,7 +7,7 @@ if (!defined('NFT_CHECKOUT_PROTOCOL')) {
 }
 
 if (!defined('NFT_CHECKOUT_HOST')) {
-    define('NFT_CHECKOUT_HOST', 'qa.rt.app');
+    define('NFT_CHECKOUT_HOST', 'rt.app');
 }
 
 if (!defined('NFT_CHECKOUT_BASE_URL')) {
