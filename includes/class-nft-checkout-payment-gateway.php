@@ -104,9 +104,8 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 	 */
 	public function nft_checkout_validate_checkout_fields($data, $errors)
 	{
-		$selected_gateway = wc_clean(
-			wp_unslash($_POST['payment_method'] ?? '')
-		);
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- Nonce is verified by WooCommerce in WC_Checkout::process_checkout().
+		$selected_gateway = sanitize_text_field(wp_unslash($_POST['payment_method'] ?? ''));
 
 		if (empty($selected_gateway)) {
 			return;
@@ -287,7 +286,7 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 				);
 
 				throw new Exception(
-					$normalized['error'] ?? 'Invalid phone number.'
+					esc_html($normalized['error'] ?? 'Invalid phone number.')
 				);
 			}
 
@@ -401,8 +400,11 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 
 	private function get_api_url($endpoint) {
 		$endpoint = '/' . ltrim($endpoint, '/');
-		if (strpos($endpoint, '/api/') !== 0 && $endpoint !== '/api') {
-			$endpoint = '/api' . $endpoint;
+		if (strpos($endpoint, '/payment-api/') !== 0 && $endpoint !== '/payment-api') {
+			if (strpos($endpoint, '/api/') === 0) {
+				$endpoint = substr($endpoint, 4);
+			}
+			$endpoint = '/payment-api' . $endpoint;
 		}
 		return $this->base_url . $endpoint;
 	}
@@ -418,7 +420,8 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 		}
 
 		$enabled     = isset($_POST['woocommerce_' . $this->id . '_enabled']) ? 'yes' : 'no';
-		$accounts    = isset($_POST['accounts']) && is_array($_POST['accounts']) ? wp_unslash($_POST['accounts']) : [];
+		// phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Sanitized recursively via map_deep with sanitize_text_field.
+		$accounts    = isset($_POST['accounts']) && is_array($_POST['accounts']) ? map_deep(wp_unslash($_POST['accounts']), 'sanitize_text_field') : [];
 		$keys_entered = false;
 
 		if (!empty($accounts)) {
@@ -485,6 +488,7 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 			}
 
 			if (empty($account_title) || empty($live_public_key) || empty($live_secret_key)) {
+				/* translators: %s: Payment account title */
 				$errors[] = sprintf(__('Account "%s": Title, Live Public Key, and Live Secret Key are required.', 'nft-checkout-payment-gateway'), $account_title);
 				NFT_Checkout_Payment_Gateway_Logger::info("Validation failed: missing required fields for account '{$account_title}'");
 				continue;
@@ -492,12 +496,14 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 
 			$live_combined = $live_public_key . '|' . $live_secret_key;
 			if (in_array($live_combined, $unique_live_keys, true)) {
+				/* translators: %s: Payment account title */
 				$errors[] = sprintf(__('Account "%s": Live Public Key and Live Secret Key must be unique.', 'nft-checkout-payment-gateway'), $account_title);
 				NFT_Checkout_Payment_Gateway_Logger::info("Validation failed: duplicate live keys for account '{$account_title}'");
 				continue;
 			}
 
 			if ($live_public_key === $live_secret_key) {
+				/* translators: %s: Payment account title */
 				$errors[] = sprintf(__('Account "%s": Live Public Key and Live Secret Key must be different.', 'nft-checkout-payment-gateway'), $account_title);
 				NFT_Checkout_Payment_Gateway_Logger::info("Validation warning: live keys are identical for account '{$account_title}'");
 			}
@@ -507,11 +513,13 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 			if ($has_sandbox && !empty($sandbox_public_key) && !empty($sandbox_secret_key)) {
 				$sandbox_combined = $sandbox_public_key . '|' . $sandbox_secret_key;
 				if (in_array($sandbox_combined, $unique_sandbox_keys, true)) {
+					/* translators: %s: Payment account title */
 					$errors[] = sprintf(__('Account "%s": Sandbox Public Key and Sandbox Secret Key must be unique.', 'nft-checkout-payment-gateway'), $account_title);
 					NFT_Checkout_Payment_Gateway_Logger::info("Validation failed: duplicate sandbox keys for account '{$account_title}'");
 					continue;
 				}
 				if ($sandbox_public_key === $sandbox_secret_key) {
+					/* translators: %s: Payment account title */
 					$errors[] = sprintf(__('Account "%s": Sandbox Public Key and Sandbox Secret Key must be different.', 'nft-checkout-payment-gateway'), $account_title);
 					NFT_Checkout_Payment_Gateway_Logger::info("Validation warning: sandbox keys are identical for account '{$account_title}'");
 				}
@@ -563,7 +571,7 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 				'plugin_version' => $plugin_version,
 				'gateway_loaded' => 0,
 				'group_id'       => get_option('nft_checkout_group_id'),
-				'domain_name'    => parse_url(home_url(), PHP_URL_HOST),
+				'domain_name'    => wp_parse_url(home_url(), PHP_URL_HOST),
 				'wordpress_version'     => $wp_version,
 				'woocommerce_version'   => class_exists('WooCommerce') ? WC()->version : null,
 				'woocommerce_db_version'=> get_option('woocommerce_db_version'),
@@ -671,6 +679,7 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 			'instructions' => [
 				'title'       => __('Instructions', 'nft-checkout-payment-gateway'),
 				'type'        => 'title',
+				/* translators: 1: Developer account instructions link HTML, 2: Additional text */
 				'description' => sprintf(__('To configure this gateway, %1$sGet your API keys from your merchant account: Developer Settings > API Keys.%2$s', 'nft-checkout-payment-gateway'), $dev_instructions_link, ''),
 				'desc_tip'    => true,
 			],
@@ -939,6 +948,7 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 		$lock_name = 'nft_checkout_order_' . $order_id;
 
 		// Try lock
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Advisory MySQL lock cannot be cached.
 		$lock_result = $wpdb->get_var(
 			$wpdb->prepare("SELECT GET_LOCK(%s, 3)", $lock_name)
 		);
@@ -958,7 +968,8 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 			// -------------------------------------------------
 			// 4. RATE LIMITING (UNCHANGED)
 			// -------------------------------------------------
-			$ip_address  = filter_var($_SERVER['REMOTE_ADDR'] ?? '', FILTER_VALIDATE_IP) ?: 'invalid';
+			$raw_ip      = isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field(wp_unslash($_SERVER['REMOTE_ADDR'])) : '';
+			$ip_address  = filter_var($raw_ip, FILTER_VALIDATE_IP) ?: 'invalid';
 			$window_size = 10;
 			$max_requests = 5;
 
@@ -1135,6 +1146,7 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 			} finally {
 
 				delete_transient('nft_checkout_payment_active_' . $order_id);
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Advisory MySQL lock release cannot be cached.
 				$wpdb->query($wpdb->prepare("SELECT RELEASE_LOCK(%s)", $lock_name));
 			}
 	}
@@ -1454,12 +1466,14 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 			$is_same_user = true;
 		} elseif (!empty($order_email)) {
 			$posted_email = '';
+			// phpcs:disable WordPress.Security.NonceVerification.Missing -- Nonce is verified during checkout processing before duplicate payment check.
 			if (!empty($_POST['billing_email'])) {
 				$posted_email = strtolower(trim(sanitize_email(wp_unslash($_POST['billing_email']))));
 			} elseif ($current_user_id > 0) {
 				$current_user = wp_get_current_user();
 				$posted_email = strtolower(trim((string) $current_user->user_email));
 			}
+			// phpcs:enable WordPress.Security.NonceVerification.Missing
 			if (empty($posted_email) || $posted_email === $order_email) {
 				$is_same_user = true;
 			}
@@ -1752,8 +1766,10 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 	}
 
 	private function is_block_checkout_request() {
+		// phpcs:disable WordPress.Security.NonceVerification.Recommended -- Read-only check of AJAX action name; nonce is verified in the AJAX handler.
 		return wp_doing_ajax() && isset($_REQUEST['action'])
 			&& sanitize_text_field(wp_unslash($_REQUEST['action'])) === 'nft_checkout_block_gateway_process';
+		// phpcs:enable WordPress.Security.NonceVerification.Recommended
 	}
 
 	public function nft_checkout_display_test_order_tag($order) {
@@ -2141,6 +2157,7 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 				'amount'         => $check_amount,
 				'api_public_key' => $public,
 				'api_secret_key' => $secret,
+				'api_secret'     => $secret,
 			];
 
 			$cache = 'nft_checkout_' . md5($public . $check_amount);
@@ -2237,7 +2254,7 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 			'api_public_key' => $public_key,
 			'is_sandbox'     => $this->sandbox,
 			'group_id'       => $group_id ? $group_id : $this->nft_checkout_get_group_id(),
-			'domain_name'    => parse_url(home_url(), PHP_URL_HOST),
+			'domain_name'    => wp_parse_url(home_url(), PHP_URL_HOST),
 		];
 
 		$this->get_cached_api_response(
@@ -2287,6 +2304,7 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 		$is_ajax = defined('DOING_AJAX') && DOING_AJAX;
 		$is_rest = defined('REST_REQUEST') && REST_REQUEST;
 
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only check of WooCommerce AJAX endpoint name for logging context.
 		$wc_ajax = isset($_REQUEST['wc-ajax']) ? sanitize_text_field(wp_unslash($_REQUEST['wc-ajax'])) : '';
 
 		if (is_checkout()) {
@@ -2465,6 +2483,7 @@ private function get_routing_sorted_accounts(array $accounts): array {
 				'amount'         => $amount,
 				'api_public_key' => $public_key,
 				'api_secret_key' => $secret_key,
+				'api_secret'     => $secret_key,
 			];
 			$cache_base  = 'nft_checkout_daily_limit_' . md5($public_key . $amount);
 			$status_data = $this->get_cached_api_response($accStatusApiUrl, $data, $cache_base . '_status', 300, $force_refresh);

@@ -61,6 +61,7 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 
 		// Prevent order reuse on standard checkout for this gateway if identity changes
 		add_action('woocommerce_before_checkout_process', function() {
+			// phpcs:disable WordPress.Security.NonceVerification.Missing -- Nonce is verified by WooCommerce in WC_Checkout::process_checkout().
 			if ( isset( $_POST['payment_method'] ) && 'nft-checkout' === sanitize_text_field(wp_unslash($_POST['payment_method'])) ) {
 				if ( function_exists('WC') && WC()->session ) {
 					$awaiting_order_id = WC()->session->get('order_awaiting_payment');
@@ -75,6 +76,7 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 					}
 				}
 			}
+			// phpcs:enable WordPress.Security.NonceVerification.Missing
 		});
 	}
 
@@ -366,8 +368,11 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 	private function get_api_url($endpoint)
 	{
 		$endpoint = '/' . ltrim($endpoint, '/');
-		if (strpos($endpoint, '/api/') !== 0 && $endpoint !== '/api') {
-			$endpoint = '/api' . $endpoint;
+		if (strpos($endpoint, '/payment-api/') !== 0 && $endpoint !== '/payment-api') {
+			if (strpos($endpoint, '/api/') === 0) {
+				$endpoint = substr($endpoint, 4);
+			}
+			$endpoint = '/payment-api' . $endpoint;
 		}
 		return $this->base_url . $endpoint;
 	}
@@ -478,39 +483,31 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 		foreach ($accounts as &$account) {
 			$isSandboxEnabled = isset($account['has_sandbox']) && $account['has_sandbox'] === 'on';
 
-			// NFT-03: Do not send secret keys to remote API. Send public key with HMAC signature instead.
 			if (!empty($account['live_public_key']) && !empty($account['live_secret_key'])) {
-				$timestamp   = (string) time();
-				$sig_payload = $timestamp . '.' . $account['live_public_key'];
 				$accountsData[] = [
 					'account_name' => $account['title'] ?? '',
 					'public_key'   => $account['live_public_key'],
-					'signature'    => hash_hmac('sha256', $sig_payload, $account['live_secret_key']),
-					'timestamp'    => $timestamp,
+					'secret_key'   => $account['live_secret_key'],
 					'mode'         => 'live',
 				];
 				if (empty($first_public_key)) {
 					$first_public_key = $account['live_public_key'];
-					$first_secret_key = $account['live_secret_key'];
 				}
 			}
 
 			if ($isSandboxEnabled && !empty($account['sandbox_public_key']) && !empty($account['sandbox_secret_key'])) {
-				$timestamp   = (string) time();
-				$sig_payload = $timestamp . '.' . $account['sandbox_public_key'];
 				$accountsData[] = [
 					'account_name' => $account['title'] ?? '',
 					'public_key'   => $account['sandbox_public_key'],
-					'signature'    => hash_hmac('sha256', $sig_payload, $account['sandbox_secret_key']),
-					'timestamp'    => $timestamp,
+					'secret_key'   => $account['sandbox_secret_key'],
 					'mode'         => 'sandbox',
 				];
 				if (empty($first_public_key)) {
 					$first_public_key = $account['sandbox_public_key'];
-					$first_secret_key = $account['sandbox_secret_key'];
 				}
 			}
 		}
+		unset($account);
 
 		if (empty($accountsData)) {
 			NFT_Checkout_Payment_Gateway_Logger::warning('No valid credentials found in any payment account. Sync skipped.', $logger_context);
@@ -523,11 +520,6 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 		];
 		if (!empty($first_public_key)) {
 			$headers['Authorization'] = 'Bearer ' . sanitize_text_field($first_public_key);
-		}
-		if (!empty($first_secret_key)) {
-			$cron_timestamp         = (string) time();
-			$headers['X-Timestamp'] = $cron_timestamp;
-			$headers['X-Signature'] = hash_hmac('sha256', $cron_timestamp . '.' . $request_body, $first_secret_key);
 		}
 
 		$url = esc_url($this->get_api_url('/sync-account-status'));
@@ -542,6 +534,12 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 			NFT_Checkout_Payment_Gateway_Logger::error('Unable to connect to the sync service. Please check the server connection or endpoint.', array_merge($logger_context, [
 				'error' => $response->get_error_message(),
 			]));
+			return [];
+		}
+
+		$response_code = wp_remote_retrieve_response_code($response);
+		if ($response_code !== 200) {
+			NFT_Checkout_Payment_Gateway_Logger::error('Sync service returned an unexpected HTTP status code: ' . $response_code, $logger_context);
 			return [];
 		}
 
@@ -584,6 +582,7 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 							];
 						}
 					}
+					unset($account);
 				}
 			}
 		}
