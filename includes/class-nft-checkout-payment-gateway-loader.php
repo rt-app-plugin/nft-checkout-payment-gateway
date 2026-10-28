@@ -42,6 +42,7 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 		$this->admin_notices = new NFT_CHECKOUT_PAYMENT_GATEWAY_Admin_Notices();
 
 		add_action('admin_init', [$this, 'nft_checkout_handle_environment_check']);
+		add_action('admin_init', [$this, 'nft_checkout_maybe_sync_orders_on_admin']);
 		add_action('admin_notices', [$this->admin_notices, 'display_notices']);
 		add_action('plugins_loaded', [$this, 'nft_checkout_init'], 10);
 
@@ -605,7 +606,258 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 			NFT_Checkout_Payment_Gateway_Logger::info('Sync completed. No account status data was returned from the server.', $logger_context);
 		}
 
+		$this->sync_pending_orders();
+
 		return $statusSummary;
+	}
+
+	/**
+	 * Automatically sync pending NFT Checkout orders when viewing WooCommerce Orders in WP Admin.
+	 */
+	public function nft_checkout_maybe_sync_orders_on_admin()
+	{
+		if (!is_admin() || wp_doing_ajax() || !current_user_can('edit_shop_orders')) {
+			return;
+		}
+
+		// phpcs:disable WordPress.Security.NonceVerification.Recommended -- Read-only check of current admin page query parameters.
+		$page      = isset($_GET['page']) ? sanitize_text_field(wp_unslash($_GET['page'])) : '';
+		$post_type = isset($_GET['post_type']) ? sanitize_text_field(wp_unslash($_GET['post_type'])) : '';
+		$order_id  = isset($_GET['id']) ? absint(wp_unslash($_GET['id'])) : (isset($_GET['post']) ? absint(wp_unslash($_GET['post'])) : 0);
+		// phpcs:enable WordPress.Security.NonceVerification.Recommended
+
+		if ($page !== 'wc-orders' && $post_type !== 'shop_order' && $order_id <= 0) {
+			return;
+		}
+
+		if ($order_id > 0) {
+			$order = wc_get_order($order_id);
+			if ($order instanceof WC_Order) {
+				$this->sync_single_order_status($order);
+			}
+			return;
+		}
+
+		if (get_transient('nft_checkout_admin_pending_sync_lock')) {
+			return;
+		}
+
+		set_transient('nft_checkout_admin_pending_sync_lock', 1, 15);
+		$this->sync_pending_orders(10);
+	}
+
+	/**
+	 * Sync all pending NFT Checkout orders with the remote payment API.
+	 *
+	 * @param int $limit Max number of pending orders to check per run.
+	 * @return array Summary of synced order statuses.
+	 */
+	public function sync_pending_orders($limit = 20)
+	{
+		if (!function_exists('wc_get_orders')) {
+			return [];
+		}
+
+		$orders = wc_get_orders([
+			'status'         => ['pending', 'on-hold'],
+			'payment_method' => 'nft-checkout',
+			'limit'          => absint($limit),
+			'orderby'        => 'date',
+			'order'          => 'DESC',
+		]);
+
+		$synced = [];
+		if (!empty($orders) && is_array($orders)) {
+			foreach ($orders as $order) {
+				if ($order instanceof WC_Order) {
+					$result = $this->sync_single_order_status($order);
+					if ($result) {
+						$synced[$order->get_id()] = $result;
+					}
+				}
+			}
+		}
+
+		return $synced;
+	}
+
+	/**
+	 * Sync a single NFT Checkout order status with the remote payment API.
+	 *
+	 * @param WC_Order|int $order Order instance or order ID.
+	 * @return string|null Resolved state ('success', 'failed', 'cancelled', 'expired', 'processing') or null.
+	 */
+	public function sync_single_order_status($order)
+	{
+		if (is_numeric($order)) {
+			$order = wc_get_order(absint($order));
+		}
+
+		if (!$order instanceof WC_Order) {
+			return null;
+		}
+
+		$payment_method = $order->get_payment_method();
+		if ($payment_method !== 'nft-checkout' && $payment_method !== 'nft_checkout') {
+			return null;
+		}
+
+		if ($order->has_status(['processing', 'completed']) || $order->get_meta('_nft_checkout_state') === 'success') {
+			return 'success';
+		}
+
+		$order_id = $order->get_id();
+		$pay_id   = sanitize_text_field((string) $order->get_meta('_nft_checkout_pay_id'));
+
+		if (empty($pay_id)) {
+			$voucher_id   = sanitize_text_field((string) $order->get_meta('_nft_checkout_voucher_id'));
+			$purchase_url = esc_url_raw((string) $order->get_meta('_nft_checkout_voucher_purchase_url'));
+
+			if (!empty($voucher_id) && !empty($purchase_url)) {
+				$query_str  = (string) wp_parse_url($purchase_url, PHP_URL_QUERY);
+				$query_vars = [];
+				if (!empty($query_str)) {
+					wp_parse_str($query_str, $query_vars);
+				}
+				$signature = isset($query_vars['signature']) ? sanitize_text_field((string) $query_vars['signature']) : '';
+
+				if (!empty($signature)) {
+					$redeem_url      = $this->get_api_url('/voucher/redeem/' . rawurlencode($voucher_id));
+					$redeem_response = wp_remote_post(
+						esc_url_raw($redeem_url),
+						[
+							'headers'   => ['Content-Type' => 'application/json'],
+							'body'      => wp_json_encode(['signature' => $signature]),
+							'timeout'   => 15,
+							'sslverify' => true,
+						]
+					);
+
+					if (!is_wp_error($redeem_response) && (int) wp_remote_retrieve_response_code($redeem_response) === 200) {
+						$redeem_body = json_decode(wp_remote_retrieve_body($redeem_response), true);
+						$pay_link    = isset($redeem_body['data']['payment_link']) ? esc_url_raw((string) $redeem_body['data']['payment_link']) : '';
+						if (!empty($pay_link)) {
+							$link_path = (string) wp_parse_url($pay_link, PHP_URL_PATH);
+							if (preg_match('#/p/([a-f0-9\-]{36})#i', $link_path, $matches)) {
+								$pay_id = sanitize_text_field($matches[1]);
+								$order->update_meta_data('_nft_checkout_pay_id', $pay_id);
+								$order->save();
+
+								if (function_exists('nft_checkout_store_order_payment_link')) {
+									nft_checkout_store_order_payment_link($order, [
+										'uuid'           => $pay_id,
+										'payment_link'   => $pay_link,
+										'customer_email' => $order->get_billing_email(),
+										'amount'         => $order->get_total(),
+									]);
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if (empty($pay_id)) {
+			return null;
+		}
+
+		$status_url      = $this->get_api_url('/payment-requests/public/' . rawurlencode($pay_id) . '/status');
+		$status_response = wp_remote_get(
+			esc_url_raw($status_url),
+			[
+				'timeout'   => 15,
+				'sslverify' => true,
+			]
+		);
+
+		if (is_wp_error($status_response) || (int) wp_remote_retrieve_response_code($status_response) !== 200) {
+			return null;
+		}
+
+		$status_data = json_decode(wp_remote_retrieve_body($status_response), true);
+		if (!is_array($status_data)) {
+			return null;
+		}
+
+		$payment_status = strtolower(sanitize_text_field((string) ($status_data['payment_status'] ?? '')));
+		$settled        = !empty($status_data['settled']);
+		$failed         = !empty($status_data['failed']);
+		$tx_status      = strtolower(sanitize_text_field((string) ($status_data['transaction']['status'] ?? '')));
+		$tx_provider    = strtolower(sanitize_text_field((string) ($status_data['transaction']['provider'] ?? '')));
+		$tx_ref         = sanitize_text_field((string) ($status_data['transaction']['reference'] ?? ''));
+
+		if ($tx_provider === 'transak' && $tx_status === 'processing') {
+			wp_remote_post(
+				esc_url_raw($this->get_api_url('/payment/transak-order-status')),
+				[
+					'headers'   => ['Content-Type' => 'application/json'],
+					'body'      => wp_json_encode(['payment_uuid' => $pay_id]),
+					'timeout'   => 10,
+					'sslverify' => true,
+				]
+			);
+		}
+
+		if (!empty($tx_ref)) {
+			$order->update_meta_data('_nft_checkout_transaction_reference', $tx_ref);
+		}
+
+		$is_paid = $settled
+			|| in_array($payment_status, ['success', 'paid', 'completed'], true)
+			|| in_array($tx_status, ['success', 'paid', 'completed'], true);
+
+		if ($is_paid) {
+			if (isset($status_data['amount'])) {
+				$api_amount   = (float) $status_data['amount'];
+				$order_amount = (float) $order->get_total();
+				if (abs($api_amount - $order_amount) > 0.01) {
+					NFT_Checkout_Payment_Gateway_Logger::warning(
+						"API sync amount mismatch for order #{$order_id}: order total {$order_amount} vs API {$api_amount}",
+						['source' => 'nft-checkout-payment-gateway']
+					);
+					return null;
+				}
+			}
+
+			if (function_exists('nft_checkout_store_order_payment_link')) {
+				nft_checkout_store_order_payment_link($order, [
+					'uuid'           => $pay_id,
+					'payment_link'   => $this->base_url . '/p/' . $pay_id,
+					'customer_email' => $order->get_billing_email(),
+					'amount'         => $order->get_total(),
+				]);
+			}
+
+			NFT_Checkout_Payment_State_Engine::handle_event(
+				$order_id,
+				'webhook_update',
+				[
+					'status'        => 'success',
+					'payment_token' => $pay_id,
+					'source'        => 'API Sync',
+				]
+			);
+
+			return 'success';
+		}
+
+		if ($failed || in_array($payment_status, ['failed', 'cancelled', 'canceled', 'expired'], true)) {
+			$resolved_fail = $failed ? 'failed' : $payment_status;
+			NFT_Checkout_Payment_State_Engine::handle_event(
+				$order_id,
+				'webhook_update',
+				[
+					'status'        => $resolved_fail,
+					'payment_token' => $pay_id,
+					'source'        => 'API Sync',
+				]
+			);
+
+			return $resolved_fail;
+		}
+
+		return 'processing';
 	}
 
 

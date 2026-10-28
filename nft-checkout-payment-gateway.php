@@ -69,6 +69,11 @@ add_filter('woocommerce_get_checkout_order_received_url', function($url, $order)
         return $url;
     }
 
+	if ($order->has_status(['pending', 'on-hold']) && class_exists('NFT_CHECKOUT_PAYMENT_GATEWAY_Loader')) {
+		NFT_CHECKOUT_PAYMENT_GATEWAY_Loader::get_instance()->sync_single_order_status($order);
+		$order = wc_get_order($order->get_id()) ?: $order;
+	}
+
 	$wc_status    = $order->get_status();
 	$engine_state = $order->get_meta('_nft_checkout_state');
 	$success_meta = $order->get_meta('_nft_checkout_payment_success');

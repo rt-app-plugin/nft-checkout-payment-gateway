@@ -167,8 +167,14 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_REST_API
 				WC()->session->set('order_awaiting_payment', $order->get_id());
 			}
 
-			// NFT-01: NEVER alter state on GET! Only redirect based on existing order status
-			$wc_status = $order->get_status();
+			// Verify order status server-to-server with the payment API before redirecting
+			if (class_exists('NFT_CHECKOUT_PAYMENT_GATEWAY_Loader')) {
+				NFT_CHECKOUT_PAYMENT_GATEWAY_Loader::get_instance()->sync_single_order_status($order);
+				$order = wc_get_order($order_id);
+			}
+
+			// NFT-01: NEVER alter state from unverified GET params! Only redirect based on verified order status
+			$wc_status = $order ? $order->get_status() : 'failed';
 			if (in_array($wc_status, ['failed', 'cancelled', 'expired'], true)) {
 				wc_add_notice('Payment was not completed. Please try again.', 'error');
 				wp_safe_redirect(wc_get_checkout_url());
