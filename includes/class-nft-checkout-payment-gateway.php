@@ -477,9 +477,11 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 			$sandbox_public_key = $account['sandbox_public_key'] ?? '';
 			$sandbox_secret_key = $account['sandbox_secret_key'] ?? '';
 			$has_sandbox         = isset($account['has_sandbox']) && $account['has_sandbox'] === 'on';
-			$live_status        = $account['live_status'] ?? 'Active';
-			$sandbox_status     = $has_sandbox ? ($account['sandbox_status'] ?? 'Active') : '';
-			$unique_id          = $account['unique_id'] ?? '';
+			$live_status        = !empty($account['live_status']) ? $account['live_status'] : 'Active';
+			$sandbox_status     = $has_sandbox ? (!empty($account['sandbox_status']) ? $account['sandbox_status'] : 'Active') : '';
+			$unique_id          = (!empty($account['unique_id']) && !preg_match('/^acc_\d+$/', $account['unique_id']))
+				? $account['unique_id']
+				: $this->nft_checkout_get_unique_id();
 			$checkout_title      = $account['checkout_title'] ?? '';
 	        $checkout_subtitle   = $account['checkout_subtitle'] ?? '';
 
@@ -782,8 +784,8 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 							$unique_id      = (!empty($account['unique_id'])) ? $account['unique_id'] : '';
 							?>
 							<div class="nft-checkout-account" data-index="<?php echo esc_attr($index); ?>">
-								<input type="hidden" name="accounts[<?php echo esc_attr($index); ?>][live_status]" value="<?php echo esc_attr($account['live_status'] ?? ''); ?>">
-								<input type="hidden" name="accounts[<?php echo esc_attr($index); ?>][sandbox_status]" value="<?php echo esc_attr($account['sandbox_status'] ?? ''); ?>">
+								<input type="hidden" class="live-status" name="accounts[<?php echo esc_attr($index); ?>][live_status]" value="<?php echo esc_attr($account['live_status'] ?? ''); ?>">
+								<input type="hidden" class="sandbox-status" name="accounts[<?php echo esc_attr($index); ?>][sandbox_status]" value="<?php echo esc_attr($account['sandbox_status'] ?? ''); ?>">
 								<div class="title-blog">
 									<h4>
 										<span class="account-name-display">
@@ -2126,7 +2128,6 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 		$selected = null;
 		$reason   = 'No eligible merchant account';
 
-		$pluginLogApiUrl        = $this->get_api_url('/plugin/check/checkout');
 		$all_accounts_limited = true;
 
 		$force_refresh = (
@@ -2232,38 +2233,6 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 		}
 
 		return $available_gateways;
-	}
-	private function send_plugin_logs($accounts, $public_key, $secret_key, $amount, $gateway_loaded, $pluginLogApiUrl, $force_refresh)
-	{
-		$plugin_version = NFT_CHECKOUT_PLUGIN_VERSION;
-		$accounts       = $this->update_accounts_uniqueID($accounts);
-		$group_id       = get_option('nft_checkout_group_id');
-		$cache_base     = 'nft_checkout_daily_limit_' . md5($public_key . $amount);
-
-		// NFT-03: Strip secret keys from telemetry/logs
-		$safe_accounts = array_map(function($acc) {
-			unset($acc['live_secret_key'], $acc['sandbox_secret_key'], $acc['secret_key']);
-			return $acc;
-		}, $accounts);
-
-		$plugin_logs_data = [
-			'valid_accounts' => $safe_accounts,
-			'gateway_loaded' => $gateway_loaded,
-			'plugin_status'  => $gateway_loaded,
-			'plugin_version' => $plugin_version,
-			'api_public_key' => $public_key,
-			'is_sandbox'     => $this->sandbox,
-			'group_id'       => $group_id ? $group_id : $this->nft_checkout_get_group_id(),
-			'domain_name'    => wp_parse_url(home_url(), PHP_URL_HOST),
-		];
-
-		$this->get_cached_api_response(
-			$pluginLogApiUrl,
-			$plugin_logs_data,
-			$cache_base . '_pluginlogs',
-			300,
-			$force_refresh
-		);
 	}
 
 	private function gateway_visibility_label($reason) {
@@ -2445,17 +2414,12 @@ private function get_routing_sorted_accounts(array $accounts): array {
 	 */
 	public function get_checkout_info_for_amount(float $amount): array {
 		$selected_account = [];
-		$sorted_accounts = array();
-		$cart_hash = WC()->cart ? WC()->cart->get_cart_hash() : 'no_cart';
 		$accounts = $this->get_all_accounts();
-		$sorted   = $this->get_routing_sorted_accounts($accounts);
-		$account  = !empty($sorted) ? $sorted[0] : null;
-		
-		$accounts = $this->get_all_accounts();
-		$available_gateways = WC()->payment_gateways->get_available_payment_gateways();
-		if (empty($accounts)) return $available_gateways;
+		if (empty($accounts)) {
+			return [];
+		}
 
-		usort($accounts, fn($a, $b) => $a['priority'] <=> $b['priority']);
+		usort($accounts, fn($a, $b) => ($a['priority'] ?? 1) <=> ($b['priority'] ?? 1));
 
 		$accStatusApiUrl        = $this->get_api_url('/check-merchant-status');
 		$transactionLimitApiUrl = $this->get_api_url('/dailylimit');
@@ -2514,12 +2478,9 @@ private function get_routing_sorted_accounts(array $accounts): array {
 			break;
 		}
 
-		$gateway_id = $this->id;
-		$available_gateways = WC()->payment_gateways->get_available_payment_gateways();
 		if ($all_accounts_limited) {
-			
 			if (!isset($limit_data['max_limit_reached']) || $limit_data['max_limit_reached'] == false) {
-				return $this->hide_gateway($available_gateways, $gateway_id);
+				return [];
 			}
 		}
 		// Fallback logic if no eligible account found

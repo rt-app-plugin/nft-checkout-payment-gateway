@@ -12,7 +12,7 @@ if (!defined('NFT_CHECKOUT_QA_HOST')) {
 
 if (!defined('NFT_CHECKOUT_HOST')) {
     $nft_checkout_environment = function_exists('wp_get_environment_type') ? wp_get_environment_type() : 'production';
-    $nft_checkout_is_qa = in_array($nft_checkout_environment, ['development', 'staging', 'local'], true) || (defined('WP_DEBUG') && WP_DEBUG);
+    $nft_checkout_is_qa = in_array($nft_checkout_environment, ['development', 'staging', 'local'], true);
     define('NFT_CHECKOUT_HOST', $nft_checkout_is_qa ? NFT_CHECKOUT_QA_HOST : 'rt.app');
 }
 

@@ -20,6 +20,7 @@ $nft_checkout_options = [
 	'woocommerce_nft_checkout_payment_gateway_accounts',
 	'nft_checkout_group_id',
 	'nft_checkout_unique_id',
+	'nft_checkout_plugin_version',
 ];
 
 foreach ($nft_checkout_options as $nft_checkout_option) {

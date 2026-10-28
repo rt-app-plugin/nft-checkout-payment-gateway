@@ -95,8 +95,14 @@ jQuery(document).ready(function ($) {
 			});
 
 			function generateUniqueId() {
-				const randomNumber = Math.floor(100000 + Math.random() * 900000); // 6 digit
-				return 'acc_' + randomNumber;
+				if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+					return 'acc_' + window.crypto.randomUUID();
+				}
+				return 'acc_' + 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+					const r = (Math.random() * 16) | 0;
+					const v = c === 'x' ? r : (r & 0x3) | 0x8;
+					return v.toString(16);
+				});
 			}
 
 			/**
@@ -471,12 +477,6 @@ jQuery(document).ready(function ($) {
 			if (!text) return '';
 			return text.charAt(0).toUpperCase() + text.slice(1).toLowerCase();
 		}
-
-		// ✅ Correct: Run sync again when sandbox toggle is changed
-		$('#woocommerce_'+gatewayId+'_sandbox').on('change', function () {
-			runAccountSync(gatewayId);
-		});
-
 
 	}
 });
