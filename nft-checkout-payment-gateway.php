@@ -7,7 +7,7 @@
  * Author URI: https://rt.app/
  * Text Domain: nft-checkout-payment-gateway
  * Plugin URI: https://github.com/rt/nft-checkout-payment-gateway
- * Version: 0.1.0
+ * Version: 1.0.0
  * License: GPLv3 or later
  * License URI: https://www.gnu.org/licenses/gpl-3.0.html
  *
