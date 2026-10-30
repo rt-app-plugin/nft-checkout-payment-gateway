@@ -50,14 +50,10 @@ class NFT_CHECKOUT_Blocks_Gateway extends AbstractPaymentMethodType {
 		}
 		return [
 			'id'          => $this->name,
-            'title'       => $title,
-            'description' => $description,
+			'title'       => $title,
+			'description' => $description,
 			'supports'    => ['products'],
 			'isActive'    => $this->is_active(),
-			'sandbox'     => $this->settings['sandbox'] ?? '',
-			'order_status'=> $this->settings['order_status'] ?? '',
-			'instructions'=> $this->settings['instructions'] ?? '',
-			'accounts'    => $this->settings['accounts'] ?? '',
 		];
 	}
 }

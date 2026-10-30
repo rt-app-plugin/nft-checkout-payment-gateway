@@ -13,17 +13,18 @@ if (!defined('WP_UNINSTALL_PLUGIN')) {
 wp_clear_scheduled_hook('nft_checkout_cron_event');
 
 // Plugin options to delete
-$options = [
+$nft_checkout_options = [
 	'woocommerce_nft-checkout_settings',
 	'woocommerce_nft_checkout_settings',
 	'woocommerce_nft-checkout_payment_gateway_accounts',
 	'woocommerce_nft_checkout_payment_gateway_accounts',
 	'nft_checkout_group_id',
 	'nft_checkout_unique_id',
+	'nft_checkout_plugin_version',
 ];
 
-foreach ($options as $option) {
-	delete_option($option);
+foreach ($nft_checkout_options as $nft_checkout_option) {
+	delete_option($nft_checkout_option);
 }
 
 // Clear plugin transients from wp_options

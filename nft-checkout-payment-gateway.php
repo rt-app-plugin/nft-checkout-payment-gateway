@@ -7,7 +7,7 @@
  * Author URI: https://rt.app/
  * Text Domain: nft-checkout-payment-gateway
  * Plugin URI: https://github.com/rt/nft-checkout-payment-gateway
- * Version: 0.1.0
+ * Version: 1.0.0
  * License: GPLv3 or later
  * License URI: https://www.gnu.org/licenses/gpl-3.0.html
  *
@@ -206,12 +206,13 @@ function nft_checkout_cancel_unpaid_order_action($order_id, $from_status = null,
 		$payment_row = wp_cache_get($cache_key, $cache_group);
 
 		if (false === $payment_row) {
-			$safe_table_name = esc_sql($table_name);
-			$sql             = "SELECT * FROM {$safe_table_name} WHERE order_id = %d LIMIT 1";
-
-			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
 			$payment_row = $wpdb->get_row(
-				$wpdb->prepare($sql, intval($order_id)),
+				$wpdb->prepare(
+					'SELECT * FROM %i WHERE order_id = %d LIMIT 1',
+					$table_name,
+					intval($order_id)
+				),
 				ARRAY_A
 			);
 
@@ -273,8 +274,11 @@ function nft_checkout_cancel_unpaid_order_action($order_id, $from_status = null,
 	}
 
 	$apiPath  = '/cancel-order-link';
-	if (strpos($apiPath, '/api/') !== 0 && $apiPath !== '/api') {
-		$apiPath = '/api' . $apiPath;
+	if (strpos($apiPath, '/payment-api/') !== 0 && $apiPath !== '/payment-api') {
+		if (strpos($apiPath, '/api/') === 0) {
+			$apiPath = substr($apiPath, 4);
+		}
+		$apiPath = '/payment-api' . $apiPath;
 	}
 	$url      = NFT_CHECKOUT_BASE_URL . $apiPath;
 	$cleanUrl = esc_url(

@@ -240,10 +240,11 @@ if (!function_exists('nft_checkout_store_order_payment_link')) {
 
 		$amount = number_format($amount, 2, '.', '');
 
-		// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$existing = $wpdb->get_row(
 			$wpdb->prepare(
-				"SELECT id, uuid, payment_link FROM {$safe_table_name} WHERE order_id = %d LIMIT 1",
+				'SELECT id, uuid, payment_link FROM %i WHERE order_id = %d LIMIT 1',
+				$table_name,
 				$order_id
 			),
 			ARRAY_A

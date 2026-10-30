@@ -95,8 +95,14 @@ jQuery(document).ready(function ($) {
 			});
 
 			function generateUniqueId() {
-				const randomNumber = Math.floor(100000 + Math.random() * 900000); // 6 digit
-				return 'acc_' + randomNumber;
+				if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+					return 'acc_' + window.crypto.randomUUID();
+				}
+				return 'acc_' + 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+					const r = (Math.random() * 16) | 0;
+					const v = c === 'x' ? r : (r & 0x3) | 0x8;
+					return v.toString(16);
+				});
 			}
 
 			/**
@@ -246,6 +252,8 @@ jQuery(document).ready(function ($) {
 				const sandboxCheckbox = $account.find("." + gatewayId + "-sandbox-checkbox");
 				const title = $account.find(".account-title");
 				const priority = $account.find(".account-priority");
+				const liveStatusInput = $account.find(".live-status");
+				const sandboxStatusInput = $account.find(".sandbox-status");
 
 				const titleVal = title.val()?.trim() || '';
 				const priorityVal = priority.val()?.trim() || '';
@@ -444,6 +452,7 @@ jQuery(document).ready(function ($) {
 							active: 'The account is valid and ready to use.',
 							inactive: 'The account is currently inactive. Please check your settings.',
 							invalid: 'The account credentials are incorrect or incomplete.',
+							pending: 'The account status is being verified.',
 							'service unavailable': 'The assigned payment provider service is currently unavailable or disabled in the portal.',
 							'service-unavailable': 'The assigned payment provider service is currently unavailable or disabled in the portal.',
 							unavailable: 'The service is currently unavailable. Please check provider configuration.',
@@ -451,13 +460,13 @@ jQuery(document).ready(function ($) {
 						};
 
 						// Determine tooltip content
-						const normalizedStatus = newStatus.toLowerCase().trim();
+						const normalizedStatus = (newStatus || 'unknown').toLowerCase().trim();
 						const tooltipText = statusTooltips[normalizedStatus] || '';
 						const statusCssClass = normalizedStatus.replace(/[\s_]+/g, '-');
 
 						if ((sandboxEnabled && mode === 'sandbox') || (!sandboxEnabled && mode === 'live')) {
 							statusLabel
-								.removeClass('active inactive invalid unknown service-unavailable service_unavailable unavailable')
+								.removeClass('active inactive invalid pending unknown service-unavailable service_unavailable unavailable')
 								.addClass(statusCssClass)
 								.attr('title', tooltipText)
 								.text((mode === 'sandbox' ? 'Sandbox Account Status: ' : 'Live Account Status: ') + capitalize(newStatus));
@@ -471,12 +480,6 @@ jQuery(document).ready(function ($) {
 			if (!text) return '';
 			return text.charAt(0).toUpperCase() + text.slice(1).toLowerCase();
 		}
-
-		// ✅ Correct: Run sync again when sandbox toggle is changed
-		$('#woocommerce_'+gatewayId+'_sandbox').on('change', function () {
-			runAccountSync(gatewayId);
-		});
-
 
 	}
 });
