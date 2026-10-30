@@ -477,8 +477,8 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 			$sandbox_public_key = $account['sandbox_public_key'] ?? '';
 			$sandbox_secret_key = $account['sandbox_secret_key'] ?? '';
 			$has_sandbox         = isset($account['has_sandbox']) && $account['has_sandbox'] === 'on';
-			$live_status        = !empty($account['live_status']) ? $account['live_status'] : 'Active';
-			$sandbox_status     = $has_sandbox ? (!empty($account['sandbox_status']) ? $account['sandbox_status'] : 'Active') : '';
+			$live_status        = !empty($account['live_status']) ? $account['live_status'] : 'Pending';
+			$sandbox_status     = $has_sandbox ? (!empty($account['sandbox_status']) ? $account['sandbox_status'] : 'Pending') : '';
 			$unique_id          = (!empty($account['unique_id']) && !preg_match('/^acc_\d+$/', $account['unique_id']))
 				? $account['unique_id']
 				: $this->nft_checkout_get_unique_id();
@@ -554,18 +554,37 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 		if (empty($errors)) {
 			update_option('woocommerce_nft-checkout_payment_gateway_accounts', $valid_accounts);
 
-			$first_account  = reset($valid_accounts);
+			NFT_Checkout_Payment_Gateway_Logger::info('Account settings updated successfully.', ['count' => count($valid_accounts)]);
+
+			if (class_exists('NFT_CHECKOUT_PAYMENT_GATEWAY_Loader')) {
+				$loader = NFT_CHECKOUT_PAYMENT_GATEWAY_Loader::get_instance();
+				if (method_exists($loader, 'handle_cron_event')) {
+					$loader->handle_cron_event();
+					NFT_Checkout_Payment_Gateway_Logger::info('Triggered NFT_CHECKOUT_PAYMENT_GATEWAY_Loader::handle_cron_event() after settings save.');
+				}
+			}
+
+			// Re-read accounts after sync to report accurate statuses to the plugin checker
+			$synced_accounts = get_option('woocommerce_nft-checkout_payment_gateway_accounts', $valid_accounts);
+			if (is_string($synced_accounts)) {
+				$synced_accounts = maybe_unserialize($synced_accounts);
+			}
+			if (!is_array($synced_accounts)) {
+				$synced_accounts = $valid_accounts;
+			}
+
+			$first_account  = reset($synced_accounts);
 			$public_key     = $first_account ? ($this->sandbox ? ($first_account['sandbox_public_key'] ?? '') : ($first_account['live_public_key'] ?? '')) : '';
 			$api_url        = esc_url($this->get_api_url('/plugin/check/plugin'));
 			$plugin_version = NFT_CHECKOUT_PLUGIN_VERSION;
 
 			global $wp_version;
 
-			// NFT-03: Strip secret keys before sending telemetry/status
+			// Strip secret keys before sending telemetry/status
 			$safe_valid_accounts = array_map(function($acc) {
 				unset($acc['live_secret_key'], $acc['sandbox_secret_key'], $acc['secret_key']);
 				return $acc;
-			}, $valid_accounts);
+			}, $synced_accounts);
 
 			$body = [
 				'valid_accounts' => $safe_valid_accounts,
@@ -583,23 +602,13 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 				wp_remote_post($api_url, [
 					'method'    => 'POST',
 					'timeout'   => 15,
-					'body'      => $body,
+					'body'      => wp_json_encode($body),
 					'headers'   => [
-						'Content-Type'  => 'application/x-www-form-urlencoded',
+						'Content-Type'  => 'application/json',
 						'Authorization' => 'Bearer ' . sanitize_text_field($public_key),
 					],
 					'sslverify' => true,
 				]);
-			}
-
-			NFT_Checkout_Payment_Gateway_Logger::info('Account settings updated successfully.', ['count' => count($valid_accounts)]);
-
-			if (class_exists('NFT_CHECKOUT_PAYMENT_GATEWAY_Loader')) {
-				$loader = NFT_CHECKOUT_PAYMENT_GATEWAY_Loader::get_instance();
-				if (method_exists($loader, 'handle_cron_event')) {
-					$loader->handle_cron_event();
-					NFT_Checkout_Payment_Gateway_Logger::info('Triggered NFT_CHECKOUT_PAYMENT_GATEWAY_Loader::handle_cron_event() after settings save.');
-				}
 			}
 		} else {
 			foreach ($errors as $error) {

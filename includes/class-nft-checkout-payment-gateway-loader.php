@@ -493,15 +493,11 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 		foreach ($accounts as &$account) {
 			$isSandboxEnabled = isset($account['has_sandbox']) && $account['has_sandbox'] === 'on';
 
-			// NFT-03: Do not send secret keys to remote API. Send public key with HMAC signature instead.
 			if (!empty($account['live_public_key']) && !empty($account['live_secret_key'])) {
-				$timestamp   = (string) time();
-				$sig_payload = $timestamp . '.' . $account['live_public_key'];
 				$accountsData[] = [
 					'account_name' => $account['title'] ?? '',
 					'public_key'   => $account['live_public_key'],
-					'signature'    => hash_hmac('sha256', $sig_payload, $account['live_secret_key']),
-					'timestamp'    => $timestamp,
+					'secret_key'   => $account['live_secret_key'],
 					'mode'         => 'live',
 				];
 				if (empty($first_public_key)) {
@@ -511,13 +507,10 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 			}
 
 			if ($isSandboxEnabled && !empty($account['sandbox_public_key']) && !empty($account['sandbox_secret_key'])) {
-				$timestamp   = (string) time();
-				$sig_payload = $timestamp . '.' . $account['sandbox_public_key'];
 				$accountsData[] = [
 					'account_name' => $account['title'] ?? '',
 					'public_key'   => $account['sandbox_public_key'],
-					'signature'    => hash_hmac('sha256', $sig_payload, $account['sandbox_secret_key']),
-					'timestamp'    => $timestamp,
+					'secret_key'   => $account['sandbox_secret_key'],
 					'mode'         => 'sandbox',
 				];
 				if (empty($first_public_key)) {
@@ -539,11 +532,6 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 		];
 		if (!empty($first_public_key)) {
 			$headers['Authorization'] = 'Bearer ' . sanitize_text_field($first_public_key);
-		}
-		if (!empty($first_secret_key)) {
-			$cron_timestamp         = (string) time();
-			$headers['X-Timestamp'] = $cron_timestamp;
-			$headers['X-Signature'] = hash_hmac('sha256', $cron_timestamp . '.' . $request_body, $first_secret_key);
 		}
 
 		$url = esc_url($this->get_api_url('/sync-account-status'));
@@ -997,9 +985,10 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 				'timeout'   => 30,
 				'sslverify' => true,
 				'headers'   => [
+					'Content-Type'  => 'application/json',
 					'Authorization' => 'Bearer ' . sanitize_text_field($public_key),
 				],
-				'body'      => $body,
+				'body'      => wp_json_encode($body),
 			]
 		);
 
