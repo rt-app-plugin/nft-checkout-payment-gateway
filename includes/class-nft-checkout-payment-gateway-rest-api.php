@@ -249,44 +249,33 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_REST_API
 			$log_context
 		);
 
-		// -------------------------
-		// 1. VALIDATION
-		// -------------------------
-		if ($order_id <= 0) {
-			return new WP_REST_Response([
-				'success' => false,
-				'message' => 'Invalid ID'
-			], 400);
-		}
-
-		$order = wc_get_order($order_id);
-
-		if (!$order) {
-			return new WP_REST_Response([
-				'success' => false,
-				'message' => 'Order not found'
-			], 404);
-		}
-
-		// Reject non-nft-checkout orders
-		if ($order->get_payment_method() !== 'nft-checkout' && $order->get_payment_method() !== 'nft_checkout') {
-			return new WP_REST_Response([
-				'success' => false,
-				'message' => 'Invalid payment method'
-			], 400);
-		}
-
 		// ----------------------------------------------------
-		// 2. GET REQUEST (CUSTOMER RETURN REDIRECT)
+		// 1. GET REQUEST (CUSTOMER RETURN REDIRECT)
 		// ----------------------------------------------------
+		// The customer's browser lands here coming back from the payment portal.
+		// This branch may only confirm the payment with the backend and send the
+		// customer to the right page. Nothing in the query string (order_status,
+		// pay_id, ...) is allowed to move the order by itself: the order status
+		// is cross-checked with the backend by sync_single_order_status(), which
+		// authenticates with the merchant account's secret key.
 		if ($method === 'GET') {
 			$provided_key = sanitize_text_field($data['key'] ?? ($data['order_key'] ?? ($params['key'] ?? ($params['order_key'] ?? ''))));
+			$order        = ($order_id > 0) ? wc_get_order($order_id) : false;
 
-			// Verify order key
-			if (empty($provided_key) || !hash_equals($order->get_order_key(), $provided_key)) {
+			// One uniform response for a missing order, a wrong key or a foreign
+			// payment method, so order IDs cannot be enumerated and the
+			// order-received URL (which carries the order key) is only ever
+			// issued to a caller that already holds that key.
+			if (
+				$order_id <= 0 ||
+				!$order ||
+				empty($provided_key) ||
+				!hash_equals($order->get_order_key(), $provided_key) ||
+				($order->get_payment_method() !== 'nft-checkout' && $order->get_payment_method() !== 'nft_checkout')
+			) {
 				return new WP_REST_Response([
 					'success' => false,
-					'message' => 'Order not found or invalid key'
+					'message' => 'Invalid request'
 				], 403);
 			}
 
@@ -295,37 +284,41 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_REST_API
 				WC()->session->set('order_awaiting_payment', $order->get_id());
 			}
 
-			// Save pay_id if provided
+			// A pay_id in the return URL is adopted only when the order has no
+			// payment id recorded yet. Otherwise the caller could point the order
+			// at a different (already paid) payment request and have the sync
+			// below confirm it against the wrong payment.
 			if (!empty($pay_id)) {
-				$order->update_meta_data('_nft_checkout_pay_id', $pay_id);
-				$order->save();
+				$known_pay_id = sanitize_text_field((string) $order->get_meta('_nft_checkout_pay_id'));
+				if ($known_pay_id === '' && function_exists('nft_checkout_get_order_payment_link')) {
+					$link_row = nft_checkout_get_order_payment_link($order_id);
+					if (!empty($link_row->uuid)) {
+						$known_pay_id = sanitize_text_field((string) $link_row->uuid);
+					}
+				}
 
-				if (function_exists('nft_checkout_store_order_payment_link')) {
-					nft_checkout_store_order_payment_link($order, [
-						'uuid'           => $pay_id,
-						'payment_link'   => $data['payment_link'] ?? '',
-						'customer_email' => $order->get_billing_email(),
-						'amount'         => $order->get_total(),
-					]);
+				if ($known_pay_id === '') {
+					$order->update_meta_data('_nft_checkout_pay_id', $pay_id);
+					$order->save();
+
+					if (function_exists('nft_checkout_store_order_payment_link')) {
+						nft_checkout_store_order_payment_link($order, [
+							'uuid'           => $pay_id,
+							'payment_link'   => esc_url_raw((string) ($data['payment_link'] ?? '')),
+							'customer_email' => $order->get_billing_email(),
+							'amount'         => $order->get_total(),
+						]);
+					}
+				} elseif (!hash_equals($known_pay_id, $pay_id)) {
+					NFT_Checkout_Payment_Gateway_Logger::warning(
+						"Redirect for order #{$order_id} carried pay_id '{$pay_id}' but the order is recorded under '{$known_pay_id}'; ignored.",
+						$log_context
+					);
 				}
 			}
 
-			// If payment status returned in redirect indicates success, apply state transition
-			$is_success_param = in_array(strtolower($api_order_status), ['completed', 'success', 'paid'], true);
-			if ($is_success_param) {
-				NFT_Checkout_Payment_State_Engine::handle_event(
-					$order_id,
-					'redirect',
-					[
-						'status'        => $api_order_status,
-						'payment_token' => $pay_id,
-						'source'        => 'Redirect',
-					]
-				);
-				$order = wc_get_order($order_id);
-			}
-
-			// Synchronously verify and sync order status with the server if still pending
+			// Confirm the payment with the backend (signed request) while the
+			// order is still open. This is the only way a GET can move the order.
 			if ($order->has_status(['pending', 'on-hold']) && class_exists('NFT_CHECKOUT_PAYMENT_GATEWAY_Loader')) {
 				NFT_CHECKOUT_PAYMENT_GATEWAY_Loader::get_instance()->sync_single_order_status($order);
 				$order = wc_get_order($order_id);
@@ -342,8 +335,15 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_REST_API
 		}
 
 		// -------------------------
-		// 3. POST REQUEST (WEBHOOK)
+		// 2. POST REQUEST (WEBHOOK)
 		// -------------------------
+		if ($method !== 'POST') {
+			return new WP_REST_Response([
+				'success' => false,
+				'message' => 'Method not allowed'
+			], 405);
+		}
+
 		// Verify signature first; fall back to API key / nonce authentication
 		$sig_valid = $this->nft_checkout_verify_webhook_signature($request);
 		if (!$sig_valid) {
@@ -373,6 +373,33 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_REST_API
 				'success'    => false,
 				'error_code' => 'INVALID_WEBHOOK_SIGNATURE'
 			], 401);
+		}
+
+		// -------------------------
+		// 3. ORDER LOOKUP (authenticated callers only)
+		// -------------------------
+		if ($order_id <= 0) {
+			return new WP_REST_Response([
+				'success' => false,
+				'message' => 'Invalid ID'
+			], 400);
+		}
+
+		$order = wc_get_order($order_id);
+
+		if (!$order) {
+			return new WP_REST_Response([
+				'success' => false,
+				'message' => 'Order not found'
+			], 404);
+		}
+
+		// Reject non-nft-checkout orders
+		if ($order->get_payment_method() !== 'nft-checkout' && $order->get_payment_method() !== 'nft_checkout') {
+			return new WP_REST_Response([
+				'success' => false,
+				'message' => 'Invalid payment method'
+			], 400);
 		}
 
 		// Verify amount if present in payload
@@ -431,7 +458,7 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_REST_API
 		}
 
 		// -------------------------
-		// 4. ENGINE CALL
+		// 4. VERIFY PAYLOAD + ENGINE CALL
 		// -------------------------
 		if (!empty($api_order_status)) {
 			$result = NFT_Checkout_Payment_State_Engine::handle_event(
