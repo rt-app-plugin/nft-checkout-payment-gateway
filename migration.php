@@ -3,11 +3,7 @@ if ( ! defined( 'ABSPATH' ) ) exit; // Exit if accessed directly
 
 function nft_checkout_migrate_old_settings()
 {
-	// Check if option exists under new or old key
 	$beta_accounts = get_option('woocommerce_nft-checkout_payment_gateway_accounts');
-	if (!$beta_accounts) {
-		$beta_accounts = get_option('woocommerce_unified_payment_gateway_accounts');
-	}
 
 	if ($beta_accounts) {
 		if (is_string($beta_accounts)) {
@@ -32,15 +28,12 @@ function nft_checkout_migrate_old_settings()
 			nft_checkout_clean_legacy_settings_keys();
 
 			nft_checkout_trigger_sync();
-			return; // Migration complete for beta
+			return; // Migration complete
 		}
 	}
 
-	// Fallback to legacy settings
+	// Fallback to legacy single-key NFT Checkout settings
 	$old_settings = get_option('woocommerce_nft-checkout_settings');
-	if (!$old_settings) {
-		$old_settings = get_option('woocommerce_unified_settings');
-	}
 	if (is_string($old_settings)) {
 		$old_settings = maybe_unserialize($old_settings);
 	}
@@ -112,19 +105,24 @@ function nft_checkout_clean_legacy_settings_keys()
 
 function nft_checkout_trigger_sync()
 {
-	if (get_transient('nft_checkout_sync_lock')) {
+	$accounts = function_exists('nft_checkout_get_accounts') ? nft_checkout_get_accounts() : [];
+	if (empty($accounts)) {
+		return; // Do not sync on clean install before merchant accounts exist
+	}
+
+	if (get_transient('rt_nft_checkout_sync_lock')) {
 		return; // Already triggered recently
 	}
-	set_transient('nft_checkout_sync_lock', true, 5 * MINUTE_IN_SECONDS);
+	set_transient('rt_nft_checkout_sync_lock', true, 5 * MINUTE_IN_SECONDS);
 
 	if (class_exists('NFT_CHECKOUT_PAYMENT_GATEWAY_Loader')) {
 		$loader = NFT_CHECKOUT_PAYMENT_GATEWAY_Loader::get_instance();
 		if (method_exists($loader, 'handle_cron_event')) {
 			wc_get_logger()->info('Sync account for migration started.', [
-				'source' => 'nft-checkout-payment-gateway',
-				'context' => ['sync_id' => uniqid('migrate_', true)]
+				'source'  => 'nft-checkout-payment-gateway',
+				'context' => ['sync_id' => uniqid('migrate_', true)],
 			]);
-			$loader->handle_cron_event();
+			$loader->handle_cron_event(false);
 		}
 	}
 }
@@ -135,18 +133,21 @@ function nft_checkout_on_plugin_activate() {
 		nft_checkout_migrate_old_settings();
 	}
 
+	if (function_exists('nft_checkout_migrate_legacy_payment_links')) {
+		nft_checkout_migrate_legacy_payment_links();
+	}
+
 	// Activate cron
 	if (class_exists('NFT_CHECKOUT_PAYMENT_GATEWAY_Loader')) {
 		NFT_CHECKOUT_PAYMENT_GATEWAY_Loader::get_instance()->activate_cron_job();
-		NFT_CHECKOUT_PAYMENT_GATEWAY_Loader::get_instance()->nft_checkout_send_plugin_status(1, 0);
 	}
 }
 
 function nft_checkout_on_plugin_deactivate() {
-	// Deactivate cron
+	// Deactivate cron and scheduled async sync jobs
+	wp_clear_scheduled_hook('nft_checkout_async_sync_order');
 	if (class_exists('NFT_CHECKOUT_PAYMENT_GATEWAY_Loader')) {
 		NFT_CHECKOUT_PAYMENT_GATEWAY_Loader::get_instance()->deactivate_cron_job();
-		NFT_CHECKOUT_PAYMENT_GATEWAY_Loader::get_instance()->nft_checkout_send_plugin_status(0, 0);
 	}
 }
 

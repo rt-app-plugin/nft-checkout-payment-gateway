@@ -42,10 +42,6 @@
         init: function () {
 
             this.bindClassicCheckout();
-
-            this.bindBlockCheckout();
-
-            this.bindInputSanitization();
         },
 
         /* =========================================================
@@ -122,142 +118,38 @@
         },
 
         /* =========================================================
-         * BLOCK CHECKOUT
-         * ========================================================= */
-
-        bindBlockCheckout: function () {
-
-            const self = this;
-
-            document.addEventListener(
-                'click',
-                function (e) {
-
-                    const btn = e.target.closest(
-                        '.wc-block-components-checkout-place-order-button'
-                    );
-
-                    if (!btn) {
-                        return;
-                    }
-
-                    const $form = $('form.wc-block-checkout__form');
-
-                    if (!$form.length) {
-                        return;
-                    }
-
-                    const selected = $form
-                        .find(
-                            'input[name="radio-control-wc-payment-method-options"]:checked'
-                        )
-                        .val();
-
-                    if (selected !== self.PAYMENT_METHOD) {
-                        return;
-                    }
-
-                    e.preventDefault();
-                    e.stopImmediatePropagation();
-
-                    if (self.state.submitting) {
-                        return;
-                    }
-
-                    self.clearCheckoutErrors();
-
-                    self.handleBlockCheckout($form);
-
-                },
-                true
-            );
-
-            // Prevent Woo block native submit
-            document.addEventListener(
-                'submit',
-                function (e) {
-
-                    const form = e.target;
-
-                    if (!form.classList.contains('wc-block-checkout__form')) {
-                        return;
-                    }
-
-                    const selected = form.querySelector(
-                        'input[name="radio-control-wc-payment-method-options"]:checked'
-                    )?.value;
-
-                    if (selected !== self.PAYMENT_METHOD) {
-                        return;
-                    }
-
-                    e.preventDefault();
-                    e.stopImmediatePropagation();
-
-                },
-                true
-            );
-        },
-
-        handleBlockCheckout: function ($form) {
-
-            const self = this;
-
-            self.state.submitting = true;
-
-            self.state.button = $(
-                '.wc-block-components-checkout-place-order-button'
-            );
-
-            self.state.buttonText = self.state.button.text();
-
-            self.state.button
-                .prop('disabled', true)
-                .addClass('loading')
-                .text('Processing...');
-
-            let data = $form.serialize();
-
-            // Extract email and phone directly to avoid Store API sync race conditions
-            let emailField = document.querySelector('input[type="email"], #email');
-            if (emailField && emailField.value) {
-                data += '&billing_email=' + encodeURIComponent(emailField.value);
-            }
-            let phoneField = document.querySelector('input[type="tel"], #phone, input[name="phone"]');
-            if (phoneField && phoneField.value) {
-                data += '&billing_phone=' + encodeURIComponent(phoneField.value);
-            }
-
-            data += '&action=nft_checkout_block_gateway_process';
-            data += '&nonce=' + encodeURIComponent(nft_checkout_params.nft_checkout_nonce);
-
-            $.ajax({
-
-                type: 'POST',
-
-                url: nft_checkout_params.ajax_url,
-
-                data: data,
-
-                success: function (response) {
-
-                    self.handleResponse(response);
-                },
-
-                error: function (xhr, status, error) {
-
-                    self.showCheckoutError(
-                        'There was an error processing your order.'
-                    );
-
-                    self.reset();
-                }
-            });
-        },
-
-        /* =========================================================
          * RESPONSE HANDLER
          * ========================================================= */
+
+        extractErrorMessages: function (rawMessages, fallbackText) {
+            const items = [];
+            if (typeof rawMessages === 'string' && rawMessages.indexOf('<') !== -1 && typeof DOMParser === 'function') {
+                try {
+                    const doc = new DOMParser().parseFromString(rawMessages, 'text/html');
+                    doc.querySelectorAll('li').forEach(function (li) {
+                        const txt = (li.textContent || '').trim();
+                        if (txt) {
+                            items.push(txt);
+                        }
+                    });
+                    if (!items.length && doc.body) {
+                        const bodyText = (doc.body.textContent || '').trim();
+                        if (bodyText) {
+                            items.push(bodyText);
+                        }
+                    }
+                } catch (e) {
+                    // Fall back to plain string below.
+                }
+            } else if (typeof rawMessages === 'string' && rawMessages.trim()) {
+                items.push(rawMessages.trim());
+            }
+
+            if (!items.length && fallbackText) {
+                items.push(String(fallbackText));
+            }
+            return items;
+        },
 
         handleResponse: function (response) {
 
@@ -279,6 +171,11 @@
                     }
                 }
 
+                if (response && response.reload === true) {
+                    window.location.reload();
+                    return;
+                }
+
                 const success =
                     response?.result === 'success' ||
                     response?.success === true;
@@ -288,14 +185,17 @@
                     response.data?.redirect ||
                     null;
 
-                const errorMessage =
+                const plainMessage =
                     response?.message ||
-                    response?.messages ||
                     response?.data?.message ||
-                    response?.data?.messages ||
                     response?.data?.error ||
                     response?.error ||
-                    'Your order could not be placed. Please try again.';
+                    '';
+
+                const rawHtmlMessages =
+                    response?.messages ||
+                    response?.data?.messages ||
+                    '';
 
                 self.state.orderId =
                     response.order_id ||
@@ -307,9 +207,22 @@
                 // =====================================================
                 if (!success) {
 
+                    if (response && response.refresh === true) {
+                        $(document.body).trigger('update_checkout');
+                    }
+
+                    const errorItems = self.extractErrorMessages(
+                        rawHtmlMessages,
+                        plainMessage || 'Your order could not be placed. Please try again.'
+                    );
+                    const headline = errorItems.length === 1
+                        ? errorItems[0]
+                        : (plainMessage || 'Please fix the following errors:');
+                    const detailItems = errorItems.length > 1 ? errorItems : [];
+
                     setTimeout(function () {
 
-                        self.showCheckoutError(errorMessage);
+                        self.showCheckoutError(headline, detailItems);
 
                         // force scroll after Woo rerender
                         const $notice = $('.woocommerce-notices-wrapper');
@@ -638,62 +551,6 @@
                 .text(
                     this.state.buttonText || 'Place order'
                 );
-        },
-
-        /* =========================================================
-         * SANITIZATION
-         * ========================================================= */
-
-        bindInputSanitization: function () {
-            const selectors = `
-                #billing_first_name,
-                #billing-first_name,
-                #billing_last_name,
-                #billing-last_name,
-                #billing_city,
-                #billing-city,
-                input[name="billing_first_name"],
-                input[name="billing_last_name"],
-                input[name="billing_city"]
-            `;
-
-            const sanitizeInput = (input) => {
-                const clean = input.value.replace(
-                    /[^A-Za-z\s]/g,
-                    ''
-                );
-
-                if (input.value !== clean) {
-                    Object.getOwnPropertyDescriptor(
-                        HTMLInputElement.prototype,
-                        'value'
-                    ).set.call(input, clean);
-
-                    input.dispatchEvent(
-                        new Event('input', { bubbles: true })
-                    );
-                }
-            };
-
-            $(document).on(
-                'input keyup blur change paste',
-                selectors,
-                function () {
-                    const input = this;
-                    setTimeout(() => {
-                        sanitizeInput(input);
-                    }, 0);
-                }
-            );
-
-            $('#billing_address_1')
-                .on('input', function () {
-
-                    this.value = this.value.replace(
-                        /[^A-Za-z0-9\s,.\-#]/g,
-                        ''
-                    );
-                });
         }
     };
 

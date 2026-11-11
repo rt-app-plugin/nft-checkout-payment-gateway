@@ -24,51 +24,78 @@ if (!defined('NFT_CHECKOUT_PROD_HOST')) {
 }
 
 /**
- * Choose active environment:
+ * Choose which domain Sandbox Mode ("Enable Sandbox Mode" checked) uses:
+ * 'qa'  => qa.rt.app  (QA user / QA domain)
+ * 'dev' => dev.rt.app (Dev user / Dev domain)
+ *
+ * Switch this value between 'qa' and 'dev' when changing between QA and Dev users.
+ */
+if (!defined('NFT_CHECKOUT_SANDBOX_ENVIRONMENT')) {
+    define('NFT_CHECKOUT_SANDBOX_ENVIRONMENT', 'dev');
+}
+
+/**
+ * Resolve active environment:
  * 'dev'        => dev.rt.app (Development)
  * 'qa'         => qa.rt.app  (QA)
- * 'production' => rt.app     (Live)
+ * 'production' => rt.app     (Live - default for clean installations)
+ *
+ * To force QA or Dev for both live and sandbox keys from plugin config only,
+ * uncomment one of the lines below during testing (keep commented for production):
+ * // define('NFT_CHECKOUT_ENVIRONMENT', 'qa');
+ * // define('NFT_CHECKOUT_ENVIRONMENT', 'dev');
  */
 if (!defined('NFT_CHECKOUT_ENVIRONMENT')) {
-    define('NFT_CHECKOUT_ENVIRONMENT', 'qa');
-}
-
-// Resolve target host based on NFT_CHECKOUT_ENVIRONMENT
-$nft_checkout_active_env = defined('NFT_CHECKOUT_ENVIRONMENT') ? strtolower(NFT_CHECKOUT_ENVIRONMENT) : '';
-
-switch ($nft_checkout_active_env) {
-    case 'dev':
-    case 'development':
-    case 'local':
-        $nft_checkout_target_host = NFT_CHECKOUT_DEV_HOST;
-        break;
-    case 'qa':
-    case 'staging':
-        $nft_checkout_target_host = NFT_CHECKOUT_QA_HOST;
-        break;
-    case 'prod':
-    case 'production':
-        $nft_checkout_target_host = NFT_CHECKOUT_PROD_HOST;
-        break;
-    default:
-        if (defined('NFT_CHECKOUT_HOST')) {
-            $nft_checkout_target_host = NFT_CHECKOUT_HOST;
-        } else {
-            $nft_checkout_environment = function_exists('wp_get_environment_type') ? wp_get_environment_type() : 'production';
-            $nft_checkout_is_qa       = in_array($nft_checkout_environment, ['development', 'staging', 'local'], true);
-            $nft_checkout_target_host = $nft_checkout_is_qa ? NFT_CHECKOUT_QA_HOST : NFT_CHECKOUT_PROD_HOST;
+    $nft_checkout_default_env = 'production';
+    if (function_exists('get_option')) {
+        $nft_checkout_cfg_settings = get_option('woocommerce_nft-checkout_settings');
+        if (empty($nft_checkout_cfg_settings)) {
+            $nft_checkout_cfg_settings = get_option('woocommerce_nft_checkout_settings', []);
         }
-        break;
+        if (is_string($nft_checkout_cfg_settings) && function_exists('maybe_unserialize')) {
+            $nft_checkout_cfg_settings = maybe_unserialize($nft_checkout_cfg_settings);
+        }
+        if (is_array($nft_checkout_cfg_settings) && isset($nft_checkout_cfg_settings['sandbox']) && $nft_checkout_cfg_settings['sandbox'] === 'yes') {
+            $nft_checkout_sandbox_env = strtolower((string) NFT_CHECKOUT_SANDBOX_ENVIRONMENT);
+            $nft_checkout_default_env = in_array($nft_checkout_sandbox_env, ['dev', 'development', 'local'], true)
+                ? 'dev'
+                : 'qa';
+        }
+    }
+    define('NFT_CHECKOUT_ENVIRONMENT', $nft_checkout_default_env);
 }
 
+// Resolve target host: explicit NFT_CHECKOUT_HOST (e.g. from wp-config.php) always takes precedence.
 if (!defined('NFT_CHECKOUT_HOST')) {
+    $nft_checkout_active_env = strtolower((string) NFT_CHECKOUT_ENVIRONMENT);
+
+    switch ($nft_checkout_active_env) {
+        case 'dev':
+        case 'development':
+        case 'local':
+            $nft_checkout_target_host = NFT_CHECKOUT_DEV_HOST;
+            break;
+        case 'qa':
+        case 'staging':
+            $nft_checkout_target_host = NFT_CHECKOUT_QA_HOST;
+            break;
+        case 'prod':
+        case 'production':
+        default:
+            $nft_checkout_target_host = NFT_CHECKOUT_PROD_HOST;
+            break;
+    }
+
     define('NFT_CHECKOUT_HOST', $nft_checkout_target_host);
 }
 
 if (!defined('NFT_CHECKOUT_BASE_URL')) {
     // Accept an overridden host with or without a scheme / trailing slash, but always force HTTPS.
-    $nft_checkout_parsed_host = preg_replace('#^[a-z][a-z0-9+.-]*://#i', '', $nft_checkout_target_host);
+    $nft_checkout_parsed_host = preg_replace('#^[a-z][a-z0-9+.-]*://#i', '', (string) NFT_CHECKOUT_HOST);
     $nft_checkout_parsed_host = rtrim($nft_checkout_parsed_host, '/');
+    if ($nft_checkout_parsed_host === '') {
+        $nft_checkout_parsed_host = NFT_CHECKOUT_PROD_HOST;
+    }
     define('NFT_CHECKOUT_BASE_URL', NFT_CHECKOUT_PROTOCOL . $nft_checkout_parsed_host);
 }
 

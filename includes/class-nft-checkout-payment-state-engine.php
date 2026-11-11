@@ -6,15 +6,42 @@ class NFT_Checkout_Payment_State_Engine
     const LOCK_TTL  = 12;
     const EVENT_TTL = 86400;
 
+    /**
+     * Tracks whether the current transition originated from remote sync (webhook/API sync)
+     * so outbound cancel-order-link hooks do not bounce back to RT.
+     *
+     * @var bool
+     */
+    private static $applying_remote_sync = false;
+
+    /**
+     * Check whether the state engine is currently applying a remote status update.
+     *
+     * @return bool
+     */
+    public static function is_applying_remote_sync()
+    {
+        return self::$applying_remote_sync;
+    }
+
     /* =========================================================
      * ENTRY POINT
      * ========================================================= */
     public static function handle_event($order_id, $event_type, $payload = [])
     {
-        $order = wc_get_order($order_id);
-        if (!$order) return false;
+        global $wpdb;
 
-        $payment_method = $order->get_payment_method();
+        $order_id = absint($order_id);
+        if ($order_id <= 0) {
+            return false;
+        }
+
+        $precheck_order = wc_get_order($order_id);
+        if (!$precheck_order) {
+            return false;
+        }
+
+        $payment_method = $precheck_order->get_payment_method();
         if ($payment_method !== 'nft-checkout' && $payment_method !== 'nft_checkout') {
             NFT_Checkout_Payment_Gateway_Logger::warning(
                 "Refused state transition for non-nft-checkout order #{$order_id} (payment method: {$payment_method})",
@@ -23,26 +50,37 @@ class NFT_Checkout_Payment_State_Engine
             return false;
         }
 
-        $event_id = self::generate_event_id($event_type, $payload);
-
-        if ($event_type === 'api_update' && self::is_duplicate_event($order_id, $event_id)) {
-            return self::safe_response($order, 'duplicate_event_ignored', self::get_state($order));
+        $mysql_lock_name = "rt_nft_checkout_state_{$order_id}";
+        $mysql_locked    = false;
+        if (isset($wpdb) && $wpdb instanceof wpdb) {
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+            $mysql_locked = ((string) $wpdb->get_var($wpdb->prepare('SELECT GET_LOCK(%s, 3)', $mysql_lock_name)) === '1');
+            if (!$mysql_locked) {
+                return self::safe_response($precheck_order, 'locked_skip');
+            }
         }
 
-        self::mark_event($order_id, $event_id);
-
-        $lock_key = "nft_checkout_lock_{$order_id}";
+        $lock_key      = "rt_nft_checkout_lock_{$order_id}";
         $lock_acquired = add_option($lock_key, time() + self::LOCK_TTL, '', 'no');
         if (!$lock_acquired) {
             $lock_time = (int) get_option($lock_key);
             if ($lock_time > 0 && $lock_time < time()) {
                 update_option($lock_key, time() + self::LOCK_TTL, false);
             } else {
-                return self::safe_response($order, 'locked_skip');
+                if ($mysql_locked && isset($wpdb) && $wpdb instanceof wpdb) {
+                    // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+                    $wpdb->query($wpdb->prepare('SELECT RELEASE_LOCK(%s)', $mysql_lock_name));
+                }
+                return self::safe_response($precheck_order, 'locked_skip');
             }
         }
 
         try {
+            // Re-read fresh order inside the lock to prevent TOCTOU races.
+            $order = wc_get_order($order_id);
+            if (!$order) {
+                return false;
+            }
 
             $current_state = self::normalize_state(self::get_state($order));
             $new_state     = self::normalize_state(self::resolve_state($payload));
@@ -51,18 +89,31 @@ class NFT_Checkout_Payment_State_Engine
                 return self::safe_response($order, 'no_state', $current_state);
             }
 
-            if ($current_state === 'success') {
+            if ($current_state === 'success' || $current_state === 'refunded') {
+                return self::safe_response($order, 'final_success_locked', $current_state);
+            }
+
+            if ($order->is_paid() || $order->has_status(['processing', 'completed', 'refunded'])) {
                 return self::safe_response($order, 'final_success_locked', 'success');
+            }
+
+            $event_id = self::generate_event_id($new_state, $payload);
+
+            if (
+                in_array($event_type, ['webhook_update', 'api_sync', 'api_update'], true) &&
+                self::is_duplicate_event($order, $event_id)
+            ) {
+                return self::safe_response($order, 'duplicate_event_ignored', $current_state);
             }
 
             // ONLY apply state change (NO NOTES HERE)
             $can_transition = self::can_transition($current_state, $new_state);
 
             /**
-             * NFT-09: Allow success only from pending, failed or processing
+             * NFT-09: Allow success only from pending, failed, expired, in-flight processing, on-hold or checkout-draft.
              */
             if ($new_state === 'success') {
-                if (in_array($current_state, ['pending', 'failed', 'processing', 'on-hold', 'checkout-draft'], true)) {
+                if (in_array($current_state, ['pending', 'failed', 'expired', 'processing', 'on-hold', 'checkout-draft'], true)) {
                     $can_transition = true;
                 } else {
                     $can_transition = false;
@@ -87,6 +138,8 @@ class NFT_Checkout_Payment_State_Engine
                     $current_state
                 );
             }
+
+            self::mark_event($order, $event_id);
 
             /**
              * APPLY STATE
@@ -130,6 +183,10 @@ class NFT_Checkout_Payment_State_Engine
 
         } finally {
             delete_option($lock_key);
+            if ($mysql_locked && isset($wpdb) && $wpdb instanceof wpdb) {
+                // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+                $wpdb->query($wpdb->prepare('SELECT RELEASE_LOCK(%s)', $mysql_lock_name));
+            }
         }
     }
 
@@ -177,7 +234,11 @@ class NFT_Checkout_Payment_State_Engine
      * ========================================================= */
     private static function apply($order, $state, $event_type, $payload)
     {
-        if (self::get_state($order) === 'success') {
+        if (
+            self::get_state($order) === 'success' ||
+            $order->is_paid() ||
+            $order->has_status(['processing', 'completed', 'refunded'])
+        ) {
             return;
         }
 
@@ -203,17 +264,6 @@ class NFT_Checkout_Payment_State_Engine
             default      => null
         };
 
-        if ($wc_status) {
-            if ($state === 'success') {
-                $order->payment_complete($payment_token);
-                if ($wc_status && $order->get_status() !== $wc_status) {
-                    $order->update_status($wc_status, '');
-                }
-            } else {
-                $order->update_status($wc_status, '');
-            }
-        }
-
         $order->update_meta_data('_nft_checkout_state', $state);
         $order->update_meta_data('_nft_checkout_last_event', $event_type);
         $order->update_meta_data('_nft_checkout_last_event_time', current_time('mysql'));
@@ -225,6 +275,23 @@ class NFT_Checkout_Payment_State_Engine
         if ($state === 'success') {
             $order->update_meta_data('_nft_checkout_payment_success', 'yes');
             $order->update_meta_data('_nft_checkout_paid_amount', (float) $order->get_total());
+        }
+
+        if ($wc_status) {
+            $prev_remote_flag = self::$applying_remote_sync;
+            self::$applying_remote_sync = in_array($event_type, ['webhook_update', 'api_sync', 'api_update'], true);
+            try {
+                if ($state === 'success') {
+                    $order->payment_complete($payment_token);
+                    if ($wc_status && $order->get_status() !== $wc_status) {
+                        $order->update_status($wc_status, '');
+                    }
+                } else {
+                    $order->update_status($wc_status, '');
+                }
+            } finally {
+                self::$applying_remote_sync = $prev_remote_flag;
+            }
         }
 
         $order->save();
@@ -315,7 +382,7 @@ class NFT_Checkout_Payment_State_Engine
         /**
          * FAILED NOTES
          */
-        $already_synced = (int) ($order->get_meta('_nft_checkout_failed_note_count') ?: $order->get_meta('_nft_checkout_failed_note_count'));
+        $already_synced = (int) $order->get_meta('_nft_checkout_failed_note_count');
 
         $actual_failed_count = count($failed_events);
 
@@ -347,7 +414,6 @@ class NFT_Checkout_Payment_State_Engine
          */
         if (
             $success_event &&
-            !$order->get_meta('_nft_checkout_success_note_added') &&
             !$order->get_meta('_nft_checkout_success_note_added')
         ) {
 
@@ -370,7 +436,6 @@ class NFT_Checkout_Payment_State_Engine
          */
         if (
             $cancel_event &&
-            !$order->get_meta('_nft_checkout_cancel_note_added') &&
             !$order->get_meta('_nft_checkout_cancel_note_added')
         ) {
 
@@ -401,6 +466,7 @@ class NFT_Checkout_Payment_State_Engine
             'popup_close'    => 'Customer Return from Payment Page',
             'redirect'       => 'Customer Redirect',
             'webhook_update' => 'Webhook',
+            'api_sync'       => 'API Sync',
             default          => 'System'
         };
 
@@ -412,7 +478,7 @@ class NFT_Checkout_Payment_State_Engine
         }
 
         return sprintf(
-            '<strong>Voucher Pay</strong><br><br>
+            '<strong>NFT Checkout</strong><br><br>
             <strong>%s</strong><br><br>
             <strong>Payment ID:</strong> %s<br>
             <strong>Updated Via:</strong> %s<br>
@@ -464,17 +530,21 @@ class NFT_Checkout_Payment_State_Engine
      * ========================================================= */
     private static function can_transition($from, $to)
     {
-        if ($from === 'success') return false;
-        if ($from === $to) return true;
+        if ($from === 'success' || $from === 'refunded') {
+            return false;
+        }
+        if ($from === $to) {
+            return true;
+        }
 
         $map = [
-            'pending'        => ['pending', 'cancelled', 'processing', 'success', 'failed', 'on-hold'],
-            'on-hold'        => ['pending', 'cancelled', 'processing', 'success', 'failed', 'on-hold'],
-            'checkout-draft' => ['pending', 'cancelled', 'processing', 'success', 'failed', 'on-hold'],
-            'processing' => ['processing', 'success', 'failed', 'cancelled'],
-            'failed'     => ['failed', 'success', 'processing', 'cancelled', 'pending'],
-            'cancelled'  => ['cancelled', 'failed', 'processing', 'success', 'pending'],
-            'expired'    => ['expired', 'pending', 'failed', 'cancelled', 'processing', 'success'],
+            'pending'        => ['pending', 'cancelled', 'processing', 'success', 'failed', 'expired', 'on-hold'],
+            'on-hold'        => ['pending', 'cancelled', 'processing', 'success', 'failed', 'expired', 'on-hold'],
+            'checkout-draft' => ['pending', 'cancelled', 'processing', 'success', 'failed', 'expired', 'on-hold'],
+            'processing'     => ['processing', 'success', 'failed', 'cancelled', 'expired'],
+            'failed'         => ['failed', 'success', 'cancelled', 'pending'],
+            'cancelled'      => ['cancelled'],
+            'expired'        => ['expired', 'failed', 'cancelled', 'success', 'pending'],
         ];
 
         return in_array($to, $map[$from] ?? [], true);
@@ -486,13 +556,27 @@ class NFT_Checkout_Payment_State_Engine
     private static function get_state($order)
     {
         $wc_status = $order->get_status();
+
+        // Always respect WooCommerce's authoritative paid/refunded/terminal statuses first.
+        if ($wc_status === 'refunded') {
+            return 'refunded';
+        }
+        if ($order->is_paid() || in_array($wc_status, ['processing', 'completed'], true)) {
+            return 'success';
+        }
         if ($wc_status === 'cancelled') {
             return 'cancelled';
         }
+
         $meta_state = $order->get_meta('_nft_checkout_state');
+        if ($wc_status === 'failed') {
+            return ($meta_state === 'expired') ? 'expired' : 'failed';
+        }
+
         if (!empty($meta_state)) {
             return $meta_state;
         }
+
         return !empty($wc_status) ? $wc_status : 'pending';
     }
 
@@ -501,37 +585,59 @@ class NFT_Checkout_Payment_State_Engine
      * ========================================================= */
     private static function get_success_wc_status()
     {
-        $settings = get_option('woocommerce_nft-checkout_settings', []);
-        if (empty($settings)) {
-            $settings = get_option('woocommerce_nft_checkout_settings', []);
-        }
+        $settings = function_exists('nft_checkout_get_settings')
+            ? nft_checkout_get_settings()
+            : get_option('woocommerce_nft-checkout_settings', []);
         $status = $settings['order_status'] ?? 'processing';
 
-        return in_array($status, ['processing','completed'], true)
+        return in_array($status, ['processing', 'completed'], true)
             ? $status
             : 'processing';
     }
 
     /* =========================================================
-     * EVENT ID (webhook dedupe only)
+     * EVENT ID (webhook & API sync deduplication)
      * ========================================================= */
-    private static function generate_event_id($type, $payload)
+    private static function generate_event_id($state, $payload)
     {
         return hash('sha256', implode('|', [
-            $type,
-            $payload['status'] ?? '',
-            $payload['payment_token'] ?? ''
+            (string) $state,
+            (string) ($payload['payment_token'] ?? '')
         ]));
     }
 
-    private static function is_duplicate_event($order_id, $event_id)
+    private static function is_duplicate_event($order, $event_id)
     {
-        return get_transient("nft_checkout_event_{$order_id}_{$event_id}") !== false;
+        $order_id = $order->get_id();
+        if (get_transient("rt_nft_checkout_event_{$order_id}_{$event_id}") !== false) {
+            return true;
+        }
+
+        $processed = $order->get_meta('_nft_checkout_processed_events', true);
+        if (is_array($processed) && in_array($event_id, $processed, true)) {
+            return true;
+        }
+
+        return false;
     }
 
-    private static function mark_event($order_id, $event_id)
+    private static function mark_event($order, $event_id)
     {
-        set_transient("nft_checkout_event_{$order_id}_{$event_id}", 1, self::EVENT_TTL);
+        $order_id = $order->get_id();
+        set_transient("rt_nft_checkout_event_{$order_id}_{$event_id}", 1, self::EVENT_TTL);
+
+        $processed = $order->get_meta('_nft_checkout_processed_events', true);
+        if (!is_array($processed)) {
+            $processed = [];
+        }
+        if (!in_array($event_id, $processed, true)) {
+            $processed[] = $event_id;
+            if (count($processed) > 50) {
+                $processed = array_slice($processed, -50);
+            }
+            $order->update_meta_data('_nft_checkout_processed_events', $processed);
+            $order->save();
+        }
     }
 
     /* =========================================================
@@ -552,7 +658,7 @@ class NFT_Checkout_Payment_State_Engine
         // 1. PRIMARY: engine state (validated)
         $state = self::get_state($order);
 
-        if (!empty($state) && in_array($state, ['pending','processing','success','failed','cancelled','expired'], true)) {
+        if (!empty($state) && in_array($state, ['pending','processing','success','failed','cancelled','expired','refunded'], true)) {
             return $state;
         }
 

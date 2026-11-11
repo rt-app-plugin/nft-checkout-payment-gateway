@@ -162,7 +162,7 @@ jQuery(document).ready(function ($) {
 									<input type="text" class="live-public-key" name="accounts[][live_public_key]" placeholder="Public Key">
 								</div>
 								<div class="account-input">
-									<input type="text" class="live-secret-key" name="accounts[][live_secret_key]" placeholder="Secret Key">
+									<input type="password" autocomplete="new-password" class="live-secret-key" name="accounts[][live_secret_key]" data-has-secret="0" placeholder="Secret Key">
 								</div>
 							</div>
 
@@ -178,7 +178,7 @@ jQuery(document).ready(function ($) {
 										<input type="text" class="sandbox-public-key" name="accounts[][sandbox_public_key]" placeholder="Public Key">
 									</div>
 									<div class="account-input">
-										<input type="text" class="sandbox-secret-key" name="accounts[][sandbox_secret_key]" placeholder="Secret Key">
+										<input type="password" autocomplete="new-password" class="sandbox-secret-key" name="accounts[][sandbox_secret_key]" data-has-secret="0" placeholder="Secret Key">
 									</div>
 								</div>
 							</div>
@@ -284,24 +284,27 @@ jQuery(document).ready(function ($) {
 					prioritySet.add(priorityVal);
 				}
 
-				// Live keys required
+				const hasExistingLiveSecret = liveSecretKey.attr("data-has-secret") === "1";
+				const hasExistingSandboxSecret = sandboxSecretKey.attr("data-has-secret") === "1";
+
+				// Live keys required (unless a secret key is already saved on server)
 				if (!livePublicKeyVal) {
 					showErrorMessage(livePublicKey, "Live Public Key is required.");
 					hasErrors = true;
 				}
-				if (!liveSecretKeyVal) {
+				if (!liveSecretKeyVal && !hasExistingLiveSecret) {
 					showErrorMessage(liveSecretKey, "Live Secret Key is required.");
 					hasErrors = true;
 				}
 
-				// Sandbox keys required (only if checkbox checked)
+				// Sandbox keys required (only if checkbox checked and not previously saved)
 				const sandboxRequired = sandboxCheckbox.is(":checked");
 				if (sandboxRequired) {
 					if (!sandboxPublicKeyVal) {
 						showErrorMessage(sandboxPublicKey, "Sandbox Public Key is required.");
 						hasErrors = true;
 					}
-					if (!sandboxSecretKeyVal) {
+					if (!sandboxSecretKeyVal && !hasExistingSandboxSecret) {
 						showErrorMessage(sandboxSecretKey, "Sandbox Secret Key is required.");
 						hasErrors = true;
 					}
