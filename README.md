@@ -1,167 +1,69 @@
 # NFT Checkout
 
-The NFT Checkout plugin for WooCommerce 8.9+ allows you to accept fiat payments to sell products on your WooCommerce store.
+Accept card payments in WooCommerce through RT's hosted checkout. When the customer places an order, RT e-mails them a secure payment link; they pay by card on RT's page (app.rt.app) and the order is marked paid once RT confirms it.
 
-## Plugin Information
+## Plugin information
 
-**Contributors:** RT.app  
-**Tags:** woocommerce, payment gateway, fiat, RT.app  
-**Requires at least:** 6.2  
-**Tested up to:** 7.1  
-**Requires PHP:** 8.0  
-**Stable tag:** 1.0.2  
-**License:** GPLv3 or later  
+**Contributors:** RT.app
+**Tags:** woocommerce, payment gateway, card payments, RT.app
+**Requires at least:** 6.2
+**Tested up to:** 7.1
+**Requires PHP:** 8.0
+**WC requires at least:** 6.5.4
+**WC tested up to:** 11.0
+**Stable tag:** 1.0.2
+**License:** GPLv3 or later
 **License URI:** [GPLv3 License](https://www.gnu.org/licenses/gpl-3.0.html)
 
 ## Support
 
-For any issues or enhancement requests with this plugin, please contact the RT.app support team. Ensure you provide your plugin, WooCommerce, and WordPress version where applicable to expedite troubleshooting.
+For any issues or enhancement requests with this plugin, contact the RT.app support team at https://rt.app/contact-us. Provide your plugin, WooCommerce and WordPress versions to expedite troubleshooting.
 
-## Getting Started
+## Getting started
 
-1. Obtain your API keys from your RT.app dashboard in your Developer Settings - API Keys.
-2. Follow the plugin installation instructions below.
-3. You are ready to take payments in your WooCommerce store!
+1. Obtain your API keys from your RT merchant dashboard under Developer Settings > API Keys.
+2. Install and activate the plugin (below).
+3. Enter at least one account with its live public and secret keys, press "Sync Accounts" and enable the gateway.
 
 ## Installation
 
-### Minimum Requirements
+### Minimum requirements
 
-- WooCommerce 8.9 or greater
-- PHP version 8.0 or greater
+- WordPress 6.2 or greater
+- WooCommerce 6.5.4 or greater
+- PHP 8.0 or greater
 
 ### Steps
 
-## 1. Download Plugin from GitHub
+1. Download the plugin ZIP file.
+2. In WordPress go to Plugins > Add New > Upload Plugin and upload the ZIP, or extract it into `wp-content/plugins`.
+3. Activate the plugin through the Plugins menu.
+4. Go to WooCommerce > Settings > Payments > NFT Checkout.
+5. Enable the gateway, add your account(s) and keys, and save. The plugin checks the keys with RT when you save.
 
-- Visit the GitHub repository for the NFT Checkout plugin at [GitHub Repository URL](https://github.com/voucher/nft-checkout-payment-gateway).
-- Download the plugin ZIP file to your local machine.
+## How a payment works
 
-## 2. Install the Plugin in WordPress
+1. The customer chooses "Pay by card" and places the order. The order is created pending.
+2. The plugin asks RT to e-mail the customer a voucher (`POST /payment-api/voucher/send`, signed with your secret key).
+3. The customer opens the link in the e-mail and pays on RT's page.
+4. RT posts a signed status update to `/wp-json/nft-checkout/v1/data`. The plugin verifies the signature with the secret key of the account that raised the order, checks that the payment id, exact amount, currency and order match, and only then marks the order paid.
+5. The plugin also confirms open orders with RT (`POST /payment-api/update-txn-status`, signed) when the customer returns to the shop, on the thank-you page, in the background when you open a pending order, and every two hours.
 
-- **Extract the Downloaded ZIP file to your Local Machine:**
-  Extract the ZIP file containing the plugin files.
+## Configuration
 
-- **Upload via FTP or File Manager:**
-  - Connect to your WordPress site via FTP or use File Manager in your hosting control panel.
-  - Navigate to `wp-content/plugins` directory.
-  - Upload the extracted plugin folder to the plugins directory on your server.
+- **Sandbox mode** - use your sandbox keys; no real funds are taken. An admin notice reminds you while it is on.
+- **Order status** - Processing or Completed after a successful payment.
+- **Show consent checkbox** - a consent checkbox at checkout (classic and block checkout).
+- **Share plugin status with RT** - off by default. When on, the plugin reports its activation state, versions, domain and account titles/public keys to RT.
+- **Host override** - every site talks to production (`https://app.rt.app/payment-api`) for both Sandbox and Live keys; the keys decide the mode. A test shop can return another RT address from the `rt_payment_api_base` filter (for example `https://dev.rt.app/payment-api`) or define `NFT_CHECKOUT_API_BASE_URL` in `wp-config.php`. The older `NFT_CHECKOUT_HOST` / `NFT_CHECKOUT_ENVIRONMENT` settings still work. The address must be on rt.app. Traffic is always HTTPS.
 
-## 3. Activate the Plugin
+## External services and data
 
-- **Log in to WordPress Admin Dashboard:**
-  Log in to your WordPress Admin Dashboard.
-- **Navigate to Installed Plugins:**
-  Go to `Plugins` > `Installed Plugins`.
-- **Activate NFT Checkout:**
-  - Locate the NFT Checkout plugin in the list.
-  - Click `Activate` to enable the plugin.
+See the "External Services" section of `readme.txt` for every endpoint called, when, and what is sent. Secret keys are only ever used to sign requests and never leave your server; card details never pass through your shop.
 
-## 4. Obtain API Keys from RT.app Developer Settings Dashboard
+## Security notes for developers
 
-- **Log in to RT.app Account:**
-  Visit the RT.app website and log in to your account.
-- **Navigate to Developer Settings to get API Keys:**
-  Once logged in, find and access the Developer Settings.
-- **Generate or Retrieve API Keys:**
-  If API keys are not already generated, you can create new ones.
-  Locate the API Keys or Credentials section.
-  Generate or retrieve the required API keys (e.g., Public Key, Secret Key) needed for integration with the NFT Checkout plugin.
-
-## 5. Update API Keys in WooCommerce Settings
-
-- **Navigate to WooCommerce Settings:**
-  Log in to your WordPress Admin Dashboard.
-  Go to `WooCommerce` > `Settings`.
-- **Access the Payments Tab:**
-  Click on the `Payments` tab at the top of the settings page.
-- **Select NFT Checkout:**
-  Scroll down to find and select the NFT Checkout among the available payment methods.
-
-- **Add Plugin General Details:**
-
-  - **Title** : NFT Checkout
-    Description
-  - **Description** : Purchase and pay quickly with a voucher
-  - **Enable/Disable Sandbox Mode** : Toggle sandbox mode per account.
-  - **Payment Accounts (Add Multiple Accounts)** :
-    - **Adding a New Account**
-      1. Click on **Add Account** to create a new account.
-      2. Enter a **unique account title**.
-      3. Provide details for each account:
-         - _Account Title_
-         - _Priority:_ Set an order for the accounts.
-         - _Live Mode:_ Public & Secret Keys (mandatory)
-         - _Sandbox Mode:_ Public & Secret Keys (optional)
-  - **Order Status** : Select Processing or Completed.
-  - **Show Consent Checkbox** : Enabling this option will display a consent checkbox on the checkout page.
-
-- **Save Changes:**
-  Click `Save changes` at the bottom of the page to update and save your API key settings.
-
-## 6. Place Order via NFT Checkout Option
-
-- **Visit Your Store Page and Add Products to Cart:**
-  Navigate to your WordPress site's store page.
-  Browse and add desired products to the cart.
-
-- **Proceed to Checkout:**
-  Go to your WordPress site's checkout page to review your order details.
-
-- **Check Available Payment Methods:**
-  Ensure that the NFT Checkout option is visible among the available payment methods listed on the checkout page.
-
-- **Verify Integration:**
-  Confirm that customers can select the NFT Checkout as a payment option when placing their orders.
-
-## 7. Popup Window for Payment
-
-- **Secure Payment Processing:**
-  Upon selecting NFT Checkout, a secure popup window will open for payment processing.
-
-## 8. Complete the Payment Process
-
-- **Follow Instructions:**
-  Follow the instructions provided in the popup window to securely complete the payment.
-
-## 9. Redirect to WordPress Website with Order Status
-
-- **After Successful Payment:**
-  Once the payment is successfully processed, the popup window will automatically close.
-  Customers will be redirected back to your WordPress site.
-
-## 10. Check Orders in WordPress
-
-- **Verify Order Status:**
-  Log in to your WordPress Admin Dashboard.
-  Navigate to `WooCommerce` > `Orders` to view all orders.
-  Check for the latest orders placed using the NFT Checkout to verify their status.
-
-## Documentation
-
-The official documentation for this plugin is available at: [https://rt.app/docs/wordpress-plugin](https://rt.app/docs/wordpress-plugin)
-
-## Changelog
-
-### Version 1.0.2
-
-- **Wording:** Shoppers now see plain card-payment text ("Pay by card") instead of voucher/NFT wording. No payment changes.
-
-### Version 1.0.1
-
-- **Security:** The account status sync no longer sends secret keys to the API. Accounts are identified by public key and the request is HMAC-signed.
-- **Security:** All API requests are always sent over HTTPS, regardless of the store's own protocol.
-- **Environments:** Staging/development sites talk to the QA host automatically; `NFT_CHECKOUT_HOST` in `wp-config.php` still overrides the host.
-- **Links:** Documentation and Support links now point at the production site.
-
-### Version 1.0.0 (Initial Release)
-
-- **Initial Release:** Launched the NFT Checkout plugin with core payment integration functionality for WooCommerce.
-
-## Support
-
-For customer support, visit: [https://rt.app/contact-us](https://rt.app/contact-us)
-
-## Why Choose NFT Checkout?
-
-With NFT Checkout, you can easily transfer fiat payments to sell products. Choose NFT Checkout as your WooCommerce payment gateway to access your funds quickly through a powerful and secure payment engine provided by RT.app.
+- The customer return link (`GET /wp-json/nft-checkout/v1/data?order_id=&key=`) never changes an order by itself; it triggers a signed, merchant-bound confirmation with RT.
+- Webhooks require `X-Timestamp` and `X-Signature` = hex HMAC-SHA256 of `"<timestamp>.<raw body>"` keyed with the order's account secret, within 300 seconds, not replayed. No key, nonce or bearer token is accepted.
+- An order is marked paid only when the payment id, exact amount, currency, order id and mode all match (`nft_checkout_verify_payment_claim()`); a paid order is never moved down automatically.
+- `tests/harness/` holds a stub harness (no WordPress, no network) that exercises these paths: `php -n tests/harness/test_nft.php <plugin dir>`.

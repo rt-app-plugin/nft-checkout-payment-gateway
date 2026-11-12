@@ -1,3 +1,17 @@
+/**
+ * Classic (shortcode) checkout flow for NFT Checkout.
+ *
+ * Place Order is submitted to WooCommerce's own checkout endpoint, so every
+ * WooCommerce validation and hook runs server-side. On success RT has
+ * e-mailed the voucher, and this script replaces the checkout form with an
+ * "order received" panel built from the gateway's response.
+ *
+ * The block checkout does not use this file: it goes through the Store API
+ * (NFT-11, see nft-checkout-blocks.js).
+ *
+ * NFT-10: this script never rewrites billing fields. Validation of names,
+ * addresses and postcodes is the server's job.
+ */
 (function ($, window, document) {
     'use strict';
 
@@ -10,11 +24,6 @@
     const CHECK_ICON =
         '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">' +
         '<path d="M5 12.5l4.5 4.5L19 7.5"></path>' +
-        '</svg>';
-
-    const SHIELD_ICON =
-        '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
-        '<path d="M12 3l7 3v6c0 4.2-2.9 7.6-7 9-4.1-1.4-7-4.8-7-9V6l7-3z"></path>' +
         '</svg>';
 
     const EXTERNAL_ICON =
@@ -42,10 +51,6 @@
         init: function () {
 
             this.bindClassicCheckout();
-
-            this.bindBlockCheckout();
-
-            this.bindInputSanitization();
         },
 
         /* =========================================================
@@ -110,141 +115,7 @@
                     self.handleResponse(response);
                 },
 
-                error: function (xhr, status, error) {
-
-                    self.showCheckoutError(
-                        'There was an error processing your order.'
-                    );
-
-                    self.reset();
-                }
-            });
-        },
-
-        /* =========================================================
-         * BLOCK CHECKOUT
-         * ========================================================= */
-
-        bindBlockCheckout: function () {
-
-            const self = this;
-
-            document.addEventListener(
-                'click',
-                function (e) {
-
-                    const btn = e.target.closest(
-                        '.wc-block-components-checkout-place-order-button'
-                    );
-
-                    if (!btn) {
-                        return;
-                    }
-
-                    const $form = $('form.wc-block-checkout__form');
-
-                    if (!$form.length) {
-                        return;
-                    }
-
-                    const selected = $form
-                        .find(
-                            'input[name="radio-control-wc-payment-method-options"]:checked'
-                        )
-                        .val();
-
-                    if (selected !== self.PAYMENT_METHOD) {
-                        return;
-                    }
-
-                    e.preventDefault();
-                    e.stopImmediatePropagation();
-
-                    if (self.state.submitting) {
-                        return;
-                    }
-
-                    self.clearCheckoutErrors();
-
-                    self.handleBlockCheckout($form);
-
-                },
-                true
-            );
-
-            // Prevent Woo block native submit
-            document.addEventListener(
-                'submit',
-                function (e) {
-
-                    const form = e.target;
-
-                    if (!form.classList.contains('wc-block-checkout__form')) {
-                        return;
-                    }
-
-                    const selected = form.querySelector(
-                        'input[name="radio-control-wc-payment-method-options"]:checked'
-                    )?.value;
-
-                    if (selected !== self.PAYMENT_METHOD) {
-                        return;
-                    }
-
-                    e.preventDefault();
-                    e.stopImmediatePropagation();
-
-                },
-                true
-            );
-        },
-
-        handleBlockCheckout: function ($form) {
-
-            const self = this;
-
-            self.state.submitting = true;
-
-            self.state.button = $(
-                '.wc-block-components-checkout-place-order-button'
-            );
-
-            self.state.buttonText = self.state.button.text();
-
-            self.state.button
-                .prop('disabled', true)
-                .addClass('loading')
-                .text('Processing...');
-
-            let data = $form.serialize();
-
-            // Extract email and phone directly to avoid Store API sync race conditions
-            let emailField = document.querySelector('input[type="email"], #email');
-            if (emailField && emailField.value) {
-                data += '&billing_email=' + encodeURIComponent(emailField.value);
-            }
-            let phoneField = document.querySelector('input[type="tel"], #phone, input[name="phone"]');
-            if (phoneField && phoneField.value) {
-                data += '&billing_phone=' + encodeURIComponent(phoneField.value);
-            }
-
-            data += '&action=nft_checkout_block_gateway_process';
-            data += '&nonce=' + encodeURIComponent(nft_checkout_params.nft_checkout_nonce);
-
-            $.ajax({
-
-                type: 'POST',
-
-                url: nft_checkout_params.ajax_url,
-
-                data: data,
-
-                success: function (response) {
-
-                    self.handleResponse(response);
-                },
-
-                error: function (xhr, status, error) {
+                error: function () {
 
                     self.showCheckoutError(
                         'There was an error processing your order.'
@@ -374,8 +245,6 @@
                 return document.createTextNode(value);
             };
 
-            const siteName = details.site_name || window.location.hostname;
-
             const $summary = $('<div>', { 'class': 'nft-checkout-order-received__summary' });
 
             const row = function (label, value, modifier) {
@@ -419,7 +288,7 @@
                     .text('Order received'),
 
                 $('<p>', { 'class': 'nft-checkout-order-received__lead' }).append(
-                    text('Almost done \u2014 check your email ('),
+                    text('Almost done — check your email ('),
                     $('<strong>').text(details.email || ''),
                     text(') and open the link to pay by card. Your order is saved until you finish.')
                 ),
@@ -427,21 +296,16 @@
                 $summary,
 
                 $('<p>', { 'class': 'nft-checkout-order-received__foot' }).append(
-                    text('We\u2019ll send your receipt to '),
+                    text('We’ll send your receipt to '),
                     $('<strong>').text(details.email || ''),
-                    text(' once you\u2019ve paid.')
+                    text(' once you’ve paid.')
                 ),
 
                 this.buildPaymentLinkSection(details)
             );
 
-            // Replace the checkout with the panel. Hide rather than remove so
-            // the block checkout's React tree stays intact.
-            const $blockCheckout = $('.wp-block-woocommerce-checkout').first();
-
-            const $target = $blockCheckout.length
-                ? $blockCheckout
-                : $('form.checkout').first();
+            // Replace the checkout with the panel.
+            const $target = $('form.checkout').first();
 
             this.clearCheckoutErrors();
 
@@ -469,18 +333,13 @@
 
         /**
          * The voucher email's own button, for a customer whose email has not
-         * arrived: a plain link to the same Unified page, opened in a new tab.
-         *
-         * Nothing is fetched or created here. Opening it does exactly what the
-         * button in the email does - Unified sends the customer on to the
-         * voucher's payment link.
+         * arrived: a plain link to the same RT page, opened in a new tab.
          */
         buildPaymentLinkSection: function (details) {
 
             let link = this.safeLink(details.purchase_url);
 
-            // Unsigned /voucher/redeem/{uuid} links are rejected by the server with 410 "Voucher unavailable".
-            // Only use a voucher redeem link if it carries a valid cryptographic signature.
+            // Unsigned /voucher/redeem/{uuid} links are rejected by the server.
             if (link && link.indexOf('/voucher/redeem/') !== -1 && link.indexOf('signature=') === -1) {
                 link = '';
             }
@@ -513,7 +372,7 @@
         },
 
         /**
-         * A payment link fit to show and open: http(s) only, or nothing.
+         * A payment link fit to show and open: https only, or nothing.
          */
         safeLink: function (value) {
 
@@ -524,9 +383,7 @@
             try {
                 const url = new URL(value);
 
-                return url.protocol === 'https:' || url.protocol === 'http:'
-                    ? url.href
-                    : '';
+                return url.protocol === 'https:' ? url.href : '';
             } catch (e) {
                 return '';
             }
@@ -559,22 +416,11 @@
 
             $wrapper.append($box);
 
-            // Block checkout
-            const blockTarget = $('.wc-block-checkout__form');
-
-            if (blockTarget.length) {
-                blockTarget.prepend($wrapper);
-            }
-
-            // Classic checkout fallback
             const classicTarget = $('form.checkout');
 
             if (classicTarget.length) {
                 classicTarget.prepend($wrapper);
-            }
-
-            // Fallback
-            if (!blockTarget.length && !classicTarget.length) {
+            } else {
                 $('body').prepend($wrapper);
             }
 
@@ -595,8 +441,6 @@
 
             $('.woocommerce-error').remove();
 
-            $('.wc-block-components-notice-banner').remove();
-
             $('.woocommerce-message').remove();
 
             $('.woocommerce-info').remove();
@@ -606,17 +450,9 @@
 
             this.state.submitting = false;
 
-            const $blockButton = $(
-                '.wc-block-components-checkout-place-order-button'
-            );
-
-            const $classicButton = $(
+            const $button = $(
                 'button[name="woocommerce_checkout_place_order"]'
             );
-
-            const $button = $blockButton.length
-                ? $blockButton
-                : $classicButton;
 
             if (!$button.length) {
                 return;
@@ -638,62 +474,6 @@
                 .text(
                     this.state.buttonText || 'Place order'
                 );
-        },
-
-        /* =========================================================
-         * SANITIZATION
-         * ========================================================= */
-
-        bindInputSanitization: function () {
-            const selectors = `
-                #billing_first_name,
-                #billing-first_name,
-                #billing_last_name,
-                #billing-last_name,
-                #billing_city,
-                #billing-city,
-                input[name="billing_first_name"],
-                input[name="billing_last_name"],
-                input[name="billing_city"]
-            `;
-
-            const sanitizeInput = (input) => {
-                const clean = input.value.replace(
-                    /[^A-Za-z\s]/g,
-                    ''
-                );
-
-                if (input.value !== clean) {
-                    Object.getOwnPropertyDescriptor(
-                        HTMLInputElement.prototype,
-                        'value'
-                    ).set.call(input, clean);
-
-                    input.dispatchEvent(
-                        new Event('input', { bubbles: true })
-                    );
-                }
-            };
-
-            $(document).on(
-                'input keyup blur change paste',
-                selectors,
-                function () {
-                    const input = this;
-                    setTimeout(() => {
-                        sanitizeInput(input);
-                    }, 0);
-                }
-            );
-
-            $('#billing_address_1')
-                .on('input', function () {
-
-                    this.value = this.value.replace(
-                        /[^A-Za-z0-9\s,.\-#]/g,
-                        ''
-                    );
-                });
         }
     };
 

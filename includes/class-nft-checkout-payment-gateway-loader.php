@@ -5,6 +5,7 @@ if (!defined('ABSPATH')) {
 
 // Include the configuration file
 require_once plugin_dir_path(__FILE__) . 'config.php';
+require_once plugin_dir_path(__FILE__) . 'nft-checkout-payment-gateway-utils.php';
 require_once plugin_dir_path(__FILE__) . 'class-nft-checkout-payment-state-engine.php';
 require_once plugin_dir_path(__FILE__) . 'class-nft-checkout-payment-logger.php';
 /**
@@ -38,7 +39,7 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 	{
 
 		$this->base_url = NFT_CHECKOUT_BASE_URL;
-		
+
 		$this->admin_notices = new NFT_CHECKOUT_PAYMENT_GATEWAY_Admin_Notices();
 
 		add_action('admin_init', [$this, 'nft_checkout_handle_environment_check']);
@@ -48,26 +49,26 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 		add_action('wp_ajax_nft_checkout_manual_sync', [$this, 'nft_checkout_manual_sync_callback']);
 		add_action('wp_ajax_nft-checkout_manual_sync', [$this, 'nft_checkout_manual_sync_callback']);
 		add_filter('cron_schedules', [$this, 'nft_checkout_add_cron_interval']);
-		add_action('nft_checkout_cron_event', [$this, 'handle_cron_event']);
-		add_action('nft_checkout_async_sync_order', [$this, 'sync_single_order_status'], 10, 1);
+		add_action(NFT_CHECKOUT_CRON_HOOK, [$this, 'handle_cron_event']);
+		add_action(NFT_CHECKOUT_ASYNC_SYNC_HOOK, [$this, 'sync_single_order_status'], 10, 1);
+
+		// NFT-15: admin screens queue background checks instead of calling RT
+		// while they render. The one synchronous admin call is the explicit
+		// "Check NFT Checkout payment status" order action.
 		add_action('woocommerce_admin_order_data_after_order_details', [$this, 'nft_checkout_admin_order_sync_on_view']);
-		add_action('current_screen', [$this, 'nft_checkout_admin_orders_screen_sync']);
-		add_action('manage_woocommerce_page_wc-orders_custom_column', [$this, 'nft_checkout_admin_order_row_sync'], 10, 2);
-		add_action('manage_shop_order_posts_custom_column', [$this, 'nft_checkout_admin_order_row_sync_posts'], 10, 2);
-		add_action('woocommerce_thankyou', [$this, 'nft_checkout_customer_order_sync']);
-		add_action('woocommerce_view_order', [$this, 'nft_checkout_customer_order_sync']);
-		add_filter('woocommerce_order_actions', [$this, 'nft_checkout_add_order_actions']);
-		add_action('woocommerce_order_action_nft_checkout_check_status', [$this, 'nft_checkout_process_order_action_check_status']);
-		add_filter('woocommerce_shop_order_list_table_order_css_classes', [$this, 'nft_checkout_admin_order_row_filter'], 10, 2);
-		add_filter('post_class', [$this, 'nft_checkout_admin_post_class_filter'], 10, 3);
 		add_action('load-woocommerce_page_wc-orders', [$this, 'nft_checkout_admin_orders_screen_sync']);
 		add_action('load-edit.php', [$this, 'nft_checkout_admin_orders_screen_sync']);
-		add_action('wp_ajax_nft_checkout_block_gateway_process', [$this,'handle_nft_checkout_gateway_ajax']);
-		add_action('wp_ajax_nopriv_nft_checkout_block_gateway_process', [$this,'handle_nft_checkout_gateway_ajax']);
-		// NFT-29: Strip order attribution session entry only for NFT Checkout orders to prevent
-		// session-derived attribution metadata from interfering with external voucher checkout redirects.
+		add_filter('woocommerce_order_actions', [$this, 'nft_checkout_add_order_actions'], 10, 2);
+		add_action('woocommerce_order_action_nft_checkout_check_status', [$this, 'nft_checkout_process_order_action_check_status']);
+
+		// The customer's order-received / view-order pages: one throttled check.
+		add_action('woocommerce_thankyou', [$this, 'nft_checkout_customer_order_sync']);
+		add_action('woocommerce_view_order', [$this, 'nft_checkout_customer_order_sync']);
+
+		// Strip order attribution session entry only for NFT Checkout orders to prevent
+		// session-derived attribution metadata from interfering with the voucher flow.
 		add_action('woocommerce_checkout_create_order', function($order){
-			if ($order instanceof WC_Order && $order->get_payment_method() === 'nft-checkout') {
+			if ($order instanceof WC_Order && nft_checkout_is_gateway_order($order)) {
 				$order->delete_meta_data('_wc_order_attribution_session_entry');
 			}
 		}, 10);
@@ -77,14 +78,14 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 		// Prevent order reuse on standard checkout for this gateway if identity changes
 		add_action('woocommerce_before_checkout_process', function() {
 			// phpcs:disable WordPress.Security.NonceVerification.Missing -- Nonce is verified by WooCommerce in WC_Checkout::process_checkout().
-			if ( isset( $_POST['payment_method'] ) && 'nft-checkout' === sanitize_text_field(wp_unslash($_POST['payment_method'])) ) {
+			if ( isset( $_POST['payment_method'] ) && NFT_CHECKOUT_GATEWAY_ID === sanitize_text_field(wp_unslash($_POST['payment_method'])) ) {
 				if ( function_exists('WC') && WC()->session ) {
 					$awaiting_order_id = WC()->session->get('order_awaiting_payment');
 					if ( $awaiting_order_id ) {
 						$awaiting_order = wc_get_order( $awaiting_order_id );
 						$posted_email   = isset($_POST['billing_email']) ? sanitize_email(wp_unslash($_POST['billing_email'])) : '';
 						$posted_phone   = isset($_POST['billing_phone']) ? sanitize_text_field(wp_unslash($_POST['billing_phone'])) : '';
-						
+
 						if ( $awaiting_order && ( $awaiting_order->get_billing_email() !== $posted_email || $awaiting_order->get_billing_phone() !== $posted_phone ) ) {
 							WC()->session->set( 'order_awaiting_payment', null );
 						}
@@ -96,185 +97,11 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 	}
 
 	/**
-	 * ── FIXED ──────────────────────────────────────────────────────────────────
-	 * Handle the block checkout AJAX payment request.
-	 *
-	 * Root cause of "No available payment accounts":
-	 * `new NFT_CHECKOUT_PAYMENT_GATEWAY()` creates a cold instance. In an AJAX
-	 * context WooCommerce has not called init_settings() on it, so
-	 * $this->sandbox defaults to false and get_option() returns empty values.
-	 * get_next_available_account() then finds no matching keys → returns false.
-	 *
-	 * Fix: pull the already-booted instance from WC()->payment_gateways().
-	 * That instance was fully initialised during the normal WC boot cycle so
-	 * sandbox mode and account keys are correct.
-	 * ───────────────────────────────────────────────────────────────────────────
-	 */
-	function handle_nft_checkout_gateway_ajax(){
-
-		// Nonce verification
-		$nonce = isset($_POST['nonce'])
-			? sanitize_text_field(wp_unslash($_POST['nonce']))
-			: '';
-
-		if (empty($nonce) || !wp_verify_nonce($nonce, 'nft_checkout_payment')) {
-			wp_send_json(['result' => 'fail', 'error' => 'Security check failed.']);
-			die;
-		}
-
-		// Pull the already-initialised gateway from the WC registry.
-		// Never use `new NFT_CHECKOUT_PAYMENT_GATEWAY()` here — see note above.
-		$gateways       = WC()->payment_gateways()->payment_gateways();
-		$nftCheckoutPayment = $gateways['nft-checkout'] ?? null;
-
-		if (!$nftCheckoutPayment) {
-			// Fallback: manually instantiate and force-load settings from DB.
-			// Should never happen in normal operation.
-			$nftCheckoutPayment = new NFT_CHECKOUT_PAYMENT_GATEWAY();
-			$nftCheckoutPayment->init_settings();
-			$nftCheckoutPayment->load_gateway_settings();
-
-			NFT_Checkout_Payment_Gateway_Logger::warning(
-				'NFT Checkout: gateway not found in WC registry during AJAX — fell back to manual instantiation.',
-				['source' => 'nft-checkout-payment-gateway']
-			);
-		}
-
-		$orderID = WC()->session
-			? ( WC()->session->get('store_api_draft_order') ?: WC()->session->get('order_awaiting_payment') )
-			: null;
-
-		if ( ! empty( WC()->cart ) && ! WC()->cart->is_empty() ) {
-			$orderID = $this->nft_checkout_create_block_order() ?: $orderID;
-		}
-
-		$status = [];
-		if($orderID){
-			$status = $nftCheckoutPayment->process_payment($orderID);
-		}else{
-			wc_add_notice(__('Invalid order.', 'nft-checkout-payment-gateway'), 'error');
-			$status = ['result' => 'fail','error' => 'Invalid order.'];
-		}
-		
-		wp_send_json($status);
-		die;
-	}
-
-	/**
-	 * Create the WooCommerce order for a block checkout payment.
-	 *
-	 * Delegates to WC_Checkout::create_order() so line items, shipping lines,
-	 * coupons, taxes and totals are built by WooCommerce itself rather than by
-	 * hand here.
-	 *
-	 * @return int Order ID, or 0 on failure.
-	 */
-	private function nft_checkout_create_block_order() {
-
-		$checkout = WC()->checkout();
-		$data     = $checkout->get_posted_data();
-		$customer = WC()->customer;
-
-		if ( $customer ) {
-
-			$fields = [
-				'first_name',
-				'last_name',
-				'company',
-				'address_1',
-				'address_2',
-				'city',
-				'state',
-				'postcode',
-				'country',
-				'phone',
-				'email',
-			];
-
-			foreach ( $fields as $field ) {
-
-				$key = 'billing_' . $field;
-
-				if ( ! empty( $data[ $key ] ) ) {
-					continue;
-				}
-
-				$getter = 'get_' . $key;
-
-				if ( is_callable( [ $customer, $getter ] ) ) {
-					$data[ $key ] = $customer->$getter();
-				}
-			}
-		}
-
-		if ( empty( $data['payment_method'] ) ) {
-			$data['payment_method'] = 'nft-checkout';
-		}
-
-		// Prevent reusing an order if the email address OR phone number doesn't match
-		if ( WC()->session ) {
-			$awaiting_order_id = WC()->session->get('order_awaiting_payment') ?: WC()->session->get('store_api_draft_order');
-			if ( $awaiting_order_id ) {
-				$awaiting_order = wc_get_order( $awaiting_order_id );
-				$posted_email   = sanitize_email( $data['billing_email'] ?? '' );
-				$posted_phone   = sanitize_text_field( $data['billing_phone'] ?? '' );
-				
-				if ( $awaiting_order && ( $awaiting_order->get_billing_email() !== $posted_email || $awaiting_order->get_billing_phone() !== $posted_phone ) ) {
-					WC()->session->set( 'order_awaiting_payment', null );
-					WC()->session->set( 'store_api_draft_order', null );
-				}
-			}
-		}
-
-		$order_id = $checkout->create_order( $data );
-
-		if ( is_wp_error( $order_id ) ) {
-
-			NFT_Checkout_Payment_Gateway_Logger::error(
-				'Could not create order for block checkout',
-				[
-					'error' => $order_id->get_error_message(),
-				]
-			);
-
-			return 0;
-		}
-
-		if ( WC()->session ) {
-			WC()->session->set( 'order_awaiting_payment', $order_id );
-		}
-
-		$created = wc_get_order( $order_id );
-
-		$email        = $created ? $created->get_billing_email() : '';
-		$masked_email = !empty($email) && function_exists('nft_checkout_mask_email') ? nft_checkout_mask_email($email) : '';
-
-		NFT_Checkout_Payment_Gateway_Logger::info(
-			'Created order for block checkout',
-			[
-				'order_id' => $order_id,
-				'total'    => $created ? $created->get_total() : null,
-				'email'    => $masked_email,
-			]
-		);
-
-		return $order_id;
-	}
-
-	/**
 	 * Initializes the plugin.
 	 * This method is hooked into 'plugins_loaded' action.
 	 */
 	public function nft_checkout_init()
 	{
-		// NFT-07: Run legacy key cleanup on plugin version change (since activation hook does not run on updates)
-		if (get_option('nft_checkout_plugin_version') !== NFT_CHECKOUT_PLUGIN_VERSION) {
-			if (function_exists('nft_checkout_clean_legacy_settings_keys')) {
-				nft_checkout_clean_legacy_settings_keys();
-			}
-			update_option('nft_checkout_plugin_version', NFT_CHECKOUT_PLUGIN_VERSION);
-		}
-
 		// Check if the environment is compatible
 		$environment_warning = nft_checkout_check_system_requirements();
 		if ($environment_warning) {
@@ -286,8 +113,6 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 
 		// Register blocks gateway
 		$this->nft_checkout_init_blocks();
-		
-		add_action( 'enqueue_block_assets', [ $this, 'register_blocks_assets' ] );
 
 		// Initialize REST API
 		$rest_api = NFT_CHECKOUT_PAYMENT_GATEWAY_REST_API::get_instance();
@@ -308,10 +133,10 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 		if (!$error) return;
 
 		$messages = [
-			'failed'    => 'Payment failed. Please try again.',
-			'cancelled' => 'Payment was cancelled.',
-			'expired'   => 'Payment session expired. Please try again.',
-			'duplicate' => 'This order appears to be a duplicate and cannot be processed at this time.'
+			'failed'    => __('Your card payment did not go through, so you have not been charged. Please try again or choose another payment method.', 'nft-checkout-payment-gateway'),
+			'cancelled' => __('You cancelled the card payment, so you have not been charged. You can try again when you are ready.', 'nft-checkout-payment-gateway'),
+			'expired'   => __('The payment link was open for too long and closed, so you have not been charged. Please place the order again to get a new link.', 'nft-checkout-payment-gateway'),
+			'duplicate' => __('It looks like you already paid for this order, so we did not start a second payment. Check your email or your order page. If you were not charged, contact the shop.', 'nft-checkout-payment-gateway'),
 		];
 
 		// Clear error immediately
@@ -334,13 +159,13 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 		include_once NFT_CHECKOUT_PAYMENT_GATEWAY_PLUGIN_DIR . 'includes/class-nft-checkout-payment-gateway.php';
 
 		add_filter('woocommerce_payment_gateways', function ($methods) {
-			$methods[] = 'NFT_CHECKOUT_PAYMENT_GATEWAY';			
+			$methods[] = 'NFT_CHECKOUT_PAYMENT_GATEWAY';
 			return $methods;
 		});
 	}
 
 	private function nft_checkout_init_blocks() {
-		
+
 			if ( class_exists( '\Automattic\WooCommerce\Blocks\Payments\Integrations\AbstractPaymentMethodType' ) ) {
 
 				require_once NFT_CHECKOUT_PAYMENT_GATEWAY_PLUGIN_DIR . 'includes/class-nft-checkout-blocks-gateway.php';
@@ -349,54 +174,19 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 					$registry->register( new NFT_CHECKOUT_Blocks_Gateway() );
 				});
 			}
-	
+
 	}
-	
-	public function register_blocks_assets() {
-		
-		if (is_checkout()) {
-			$image_url = plugin_dir_url( dirname( __FILE__ ) ) . 'assets/images/loader.gif';
-			wp_register_script(
-				'nft-checkout-blocks-js',
-				plugin_dir_url( NFT_CHECKOUT_PAYMENT_GATEWAY_FILE ) . 'assets/js/nft-checkout-blocks.js',
-				[ 'wc-blocks-registry', 'wc-settings', 'wp-element' ],
-				NFT_CHECKOUT_PLUGIN_VERSION,
-				true
-			);
-
-			$raw_settings = get_option('woocommerce_nft-checkout_settings') ?: get_option('woocommerce_unified_settings', []);
-			$settings     = [
-				'title'       => $raw_settings['title'] ?? 'Pay by card',
-				'description' => $raw_settings['description'] ?? 'Pay securely by card. Your payment is processed by RT.',
-				'enabled'     => $raw_settings['enabled'] ?? 'no',
-			];
-
-			wp_localize_script(
-				'nft-checkout-blocks-js',
-				'nft_checkout_params',
-				[ 'settings' => $settings,
-				 'ajax_url' => admin_url('admin-ajax.php'),
-				 'nft_checkout_loader' => $image_url,
-				 'nft_checkout_nonce' => wp_create_nonce('nft_checkout_payment'), 
-				 'checkout_url' => wc_get_checkout_url(),
-				 'payment_method' => 'nft-checkout' 
-				]
-			);
-	
-		}
-	}
-
 
 	private function get_api_url($endpoint)
 	{
 		$endpoint = '/' . ltrim($endpoint, '/');
-		if (strpos($endpoint, '/payment-api/') !== 0 && $endpoint !== '/payment-api') {
-			if (strpos($endpoint, '/api/') === 0) {
-				$endpoint = substr($endpoint, 4);
-			}
-			$endpoint = '/payment-api' . $endpoint;
+		if (strpos($endpoint, '/payment-api/') === 0) {
+			return $this->base_url . $endpoint;
 		}
-		return $this->base_url . $endpoint;
+		if (strpos($endpoint, '/api/') === 0) {
+			$endpoint = substr($endpoint, 4);
+		}
+		return NFT_CHECKOUT_API_BASE_URL . $endpoint;
 	}
 
 	/**
@@ -407,7 +197,7 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 	public function nft_checkout_plugin_action_links($links)
 	{
 		$plugin_links = [
-			'<a href="' . esc_url(admin_url('admin.php?page=wc-settings&tab=checkout&section=nft-checkout')) . '">' . esc_html__('Settings', 'nft-checkout-payment-gateway') . '</a>',
+			'<a href="' . esc_url(admin_url('admin.php?page=wc-settings&tab=checkout&section=' . NFT_CHECKOUT_GATEWAY_ID)) . '">' . esc_html__('Settings', 'nft-checkout-payment-gateway') . '</a>',
 		];
 
 		return array_merge($plugin_links, $links);
@@ -452,9 +242,9 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
      */
 	public function nft_checkout_add_cron_interval($schedules)
 	{
-		$schedules['every_two_hours'] = array(
+		$schedules[NFT_CHECKOUT_CRON_INTERVAL] = array(
 			'interval' => 2 * 60 * 60, // 2 hours in seconds = 7200
-			'display'  => __('Every Two Hours', 'nft-checkout-payment-gateway')
+			'display'  => __('Every Two Hours (NFT Checkout)', 'nft-checkout-payment-gateway')
 		);
 		return $schedules;
 	}
@@ -464,260 +254,326 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 		NFT_Checkout_Payment_Gateway_Logger::info('Automatic payment status checks have been enabled.', ['source' => 'nft-checkout-payment-gateway']);
 
 		// Clear existing scheduled event if it exists
-		$timestamp = wp_next_scheduled('nft_checkout_cron_event');
-		if ($timestamp) {
-			wp_unschedule_event($timestamp, 'nft_checkout_cron_event');
-		}
+		wp_clear_scheduled_hook(NFT_CHECKOUT_CRON_HOOK);
 
 		// Schedule with new interval
-		wp_schedule_event(time(), 'every_two_hours', 'nft_checkout_cron_event');
+		wp_schedule_event(time() + 60, NFT_CHECKOUT_CRON_INTERVAL, NFT_CHECKOUT_CRON_HOOK);
 	}
 
 	function deactivate_cron_job()
 	{
 		NFT_Checkout_Payment_Gateway_Logger::info('Automatic payment status checks have been disabled.', ['source' => 'nft-checkout-payment-gateway']);
-		wp_clear_scheduled_hook('nft_checkout_cron_event');
+		wp_clear_scheduled_hook(NFT_CHECKOUT_CRON_HOOK);
+		wp_clear_scheduled_hook(NFT_CHECKOUT_ASYNC_SYNC_HOOK);
 	}
 
 
+	/**
+	 * Check every configured key pair with RT and record its status, then
+	 * reconcile the orders still waiting for payment.
+	 *
+	 * NFT-05: no secret key is ever sent. Each account proves its secret with
+	 * a signature over "<timestamp>.<public_key>" (nft_checkout_account_signature()).
+	 * Do NOT reintroduce a 'secret_key' field in this payload.
+	 */
 	public function handle_cron_event()
 	{
 		$logger_context = ['source' => 'nft-checkout-payment-gateway'];
 
-		$accounts = get_option('woocommerce_nft-checkout_payment_gateway_accounts') ?: get_option('woocommerce_unified_payment_gateway_accounts');
-		if (empty($accounts)) {
-			$accounts = get_option('woocommerce_nft-checkout_payment_gateway_accounts') ?: get_option('woocommerce_unified_payment_gateway_accounts');
-		}
-		if (is_string($accounts)) {
-			$unserialized = maybe_unserialize($accounts);
-			$accounts = is_array($unserialized) ? $unserialized : [];
-		}
+		$this->last_sync = ['ok' => true, 'reason' => '', 'statuses' => []];
 
-		if (!$accounts || !is_array($accounts)) {
+		$accounts = nft_checkout_get_accounts();
+
+		if (empty($accounts)) {
 			NFT_Checkout_Payment_Gateway_Logger::warning('No payment accounts found or the account format is invalid. Sync aborted.', $logger_context);
+			$this->last_sync = ['ok' => false, 'reason' => 'no_accounts', 'statuses' => []];
 			return [];
 		}
 
-		$accountsData     = [];
-		$first_public_key = '';
-		$first_secret_key = '';
-		$timestamp        = (string) time();
+		$accountsData = [];
+		// Status changes decided here, keyed by "<mode>|<public key>". They are
+		// merged into a fresh copy of the option just before saving, so a key
+		// the shop changed while RT was answering is never put back.
+		$changes = [];
 
-		// NFT-03: Never send secret keys to the remote API. Each account is identified by its
-		// public key and proves ownership of the secret with an HMAC-SHA256 signature:
-		//   signature = HMAC-SHA256(secret_key, timestamp . '.' . public_key)
-		// The whole request is additionally signed in the X-Timestamp / X-Signature headers below.
-		// Do NOT reintroduce a 'secret_key' field in this payload.
-		foreach ($accounts as &$account) {
+		foreach ($accounts as $account) {
 			$isSandboxEnabled = isset($account['has_sandbox']) && $account['has_sandbox'] === 'on';
 
 			if (!empty($account['live_public_key']) && !empty($account['live_secret_key'])) {
-				$accountsData[] = [
+				$accountsData[] = array_merge([
 					'account_name' => $account['title'] ?? '',
 					'public_key'   => $account['live_public_key'],
-					'secret_key'   => $account['live_secret_key'],
-					'signature'    => hash_hmac('sha256', $timestamp . '.' . $account['live_public_key'], $account['live_secret_key']),
-					'timestamp'    => $timestamp,
 					'mode'         => 'live',
-				];
-				if (empty($first_public_key)) {
-					$first_public_key = $account['live_public_key'];
-					$first_secret_key = $account['live_secret_key'];
-				}
+				], nft_checkout_account_signature($account['live_public_key'], $account['live_secret_key']));
 			}
 
 			if ($isSandboxEnabled && !empty($account['sandbox_public_key']) && !empty($account['sandbox_secret_key'])) {
-				$accountsData[] = [
+				$accountsData[] = array_merge([
 					'account_name' => $account['title'] ?? '',
 					'public_key'   => $account['sandbox_public_key'],
-					'secret_key'   => $account['sandbox_secret_key'],
-					'signature'    => hash_hmac('sha256', $timestamp . '.' . $account['sandbox_public_key'], $account['sandbox_secret_key']),
-					'timestamp'    => $timestamp,
 					'mode'         => 'sandbox',
-				];
-				if (empty($first_public_key)) {
-					$first_public_key = $account['sandbox_public_key'];
-					$first_secret_key = $account['sandbox_secret_key'];
-				}
+				], nft_checkout_account_signature($account['sandbox_public_key'], $account['sandbox_secret_key']));
 			}
 		}
-		unset($account);
 
 		if (empty($accountsData)) {
 			NFT_Checkout_Payment_Gateway_Logger::warning('No valid credentials found in any payment account. Sync skipped.', $logger_context);
+			$this->last_sync = ['ok' => false, 'reason' => 'no_keys', 'statuses' => []];
 			return [];
 		}
 
-		$request_body = wp_json_encode(['accounts' => $accountsData]);
-		$headers      = [
-			'Content-Type' => 'application/json',
-		];
-		if (!empty($first_public_key)) {
-			$headers['Authorization'] = 'Bearer ' . sanitize_text_field($first_public_key);
-		}
-		// NFT-03: Sign the full request body with the first account's secret key.
-		//   X-Signature = HMAC-SHA256(secret_key, X-Timestamp . '.' . raw_body)
-		if (!empty($first_secret_key)) {
-			$headers['X-Timestamp'] = $timestamp;
-			$headers['X-Signature'] = hash_hmac('sha256', $timestamp . '.' . $request_body, $first_secret_key);
-		}
+		$sent = array_slice($accountsData, 0, 10);
+		$url  = esc_url_raw($this->get_api_url('/sync-account-status'));
+		$body = wp_json_encode(['accounts' => $sent]);
 
-		$url = esc_url($this->get_api_url('/sync-account-status'));
 		$response = wp_remote_post($url, [
-			'headers'   => $headers,
-			'body'      => $request_body,
+			'headers'   => [
+				'Content-Type' => 'application/json',
+				'Accept'       => 'application/json',
+			],
+			'body'      => $body,
 			'timeout'   => 15,
 			'sslverify' => true,
 		]);
 
 		if (is_wp_error($response)) {
-			NFT_Checkout_Payment_Gateway_Logger::error('Unable to connect to the sync service. Please check the server connection or endpoint.', array_merge($logger_context, [
-				'error' => $response->get_error_message(),
-			]));
-			$statusSummary = [];
-			foreach ($accounts as &$account) {
-				if (!empty($account['live_public_key']) && !empty($account['live_secret_key'])) {
-					$account['live_status'] = 'Invalid';
-					$statusSummary[] = [
-						'title'  => $account['title'] ?? 'N/A',
-						'mode'   => 'live',
-						'status' => 'Invalid',
-					];
-				}
-				if (!empty($account['has_sandbox']) && $account['has_sandbox'] === 'on' && !empty($account['sandbox_public_key']) && !empty($account['sandbox_secret_key'])) {
-					$account['sandbox_status'] = 'Invalid';
-					$statusSummary[] = [
-						'title'  => $account['title'] ?? 'N/A',
-						'mode'   => 'sandbox',
-						'status' => 'Invalid',
-					];
-				}
-			}
-			unset($account);
-			update_option('woocommerce_nft-checkout_payment_gateway_accounts', $accounts);
+			NFT_Checkout_Payment_Gateway_Logger::error('Unable to connect to the sync service. Please check the server connection or endpoint.', $logger_context);
+			$this->last_sync = ['ok' => false, 'reason' => 'unreachable', 'statuses' => []];
 			$this->sync_pending_orders();
-			return $statusSummary;
+			return [];
 		}
 
-		$response_code = wp_remote_retrieve_response_code($response);
-		if ($response_code !== 200) {
-			NFT_Checkout_Payment_Gateway_Logger::error('Sync service returned an unexpected HTTP status code: ' . $response_code . ' - Response: ' . wp_remote_retrieve_body($response), $logger_context);
-			$statusSummary = [];
-			foreach ($accounts as &$account) {
-				if (!empty($account['live_public_key']) && !empty($account['live_secret_key'])) {
-					$account['live_status'] = 'Invalid';
-					$statusSummary[] = [
-						'title'  => $account['title'] ?? 'N/A',
-						'mode'   => 'live',
-						'status' => 'Invalid',
-					];
-				}
-				if (!empty($account['has_sandbox']) && $account['has_sandbox'] === 'on' && !empty($account['sandbox_public_key']) && !empty($account['sandbox_secret_key'])) {
-					$account['sandbox_status'] = 'Invalid';
-					$statusSummary[] = [
-						'title'  => $account['title'] ?? 'N/A',
-						'mode'   => 'sandbox',
-						'status' => 'Invalid',
-					];
-				}
+		$response_code = (int) wp_remote_retrieve_response_code($response);
+		if ($response_code < 200 || $response_code >= 300) {
+			NFT_Checkout_Payment_Gateway_Logger::warning(
+				'Sync API returned a non-2xx HTTP status. Sync aborted.',
+				array_merge($logger_context, [
+					'context' => [
+						'http_status' => $response_code,
+						'url'         => $url,
+					],
+				])
+			);
+			// RT answered but refused the request. Accounts that were never
+			// accepted are marked so the settings screen does not look fine.
+			foreach ($sent as $entry) {
+				$changes[$entry['mode'] . '|' . $entry['public_key']] = ['status' => 'not_connected', 'only_if_unconfirmed' => true];
 			}
-			unset($account);
-			update_option('woocommerce_nft-checkout_payment_gateway_accounts', $accounts);
+			$summary = $this->nft_checkout_store_account_statuses($changes);
+			$this->last_sync = [
+				'ok'       => false,
+				'reason'   => in_array($response_code, [400, 401, 403, 422], true) ? 'refused' : 'unreachable',
+				'statuses' => $summary,
+			];
 			$this->sync_pending_orders();
-			return $statusSummary;
+			return $summary;
 		}
 
-		$response_body = wp_remote_retrieve_body($response);
-		$response_data = json_decode($response_body, true);
+		$response_data = json_decode(wp_remote_retrieve_body($response), true);
 
-		$updated = false;
-		$statusSummary = [];
-
-		if (!empty($response_data['data'])) {
+		if (is_array($response_data) && !empty($response_data['data']) && is_array($response_data['data'])) {
 			foreach ($response_data['data'] as $statusData) {
 				if (
+					is_array($statusData) &&
 					isset($statusData['mode'], $statusData['public_key'], $statusData['status']) &&
-					!empty($statusData['status'])
+					is_string($statusData['status']) && $statusData['status'] !== '' &&
+					(empty($statusData['message']) || stripos((string) $statusData['message'], 'missing required fields') === false)
 				) {
-					foreach ($accounts as &$account) {
-						if (
-							$statusData['mode'] === 'live' &&
-							$account['live_public_key'] === $statusData['public_key']
-						) {
-							$account['live_status'] = $statusData['status'];
-							$updated = true;
-							$statusSummary[] = [
-								'title'  => $account['title'] ?? 'N/A',
-								'mode'   => $statusData['mode'],
-								'status' => $statusData['status'],
-							];
-						}
-
-						if (
-							$statusData['mode'] === 'sandbox' &&
-							$account['sandbox_public_key'] === $statusData['public_key']
-						) {
-							$account['sandbox_status'] = $statusData['status'];
-							$updated = true;
-							$statusSummary[] = [
-								'title'  => $account['title'] ?? 'N/A',
-								'mode'   => $statusData['mode'],
-								'status' => $statusData['status'],
-							];
-						}
-					}
-					unset($account);
+					$mode = strtolower(sanitize_key((string) $statusData['mode']));
+					$changes[$mode . '|' . (string) $statusData['public_key']] = [
+						'status' => sanitize_key(strtolower((string) $statusData['status'])),
+					];
 				}
 			}
 		}
 
-		if (!empty($statusSummary)) {
-			if ($updated) {
-				update_option('woocommerce_nft-checkout_payment_gateway_accounts', $accounts);
-
-				NFT_Checkout_Payment_Gateway_Logger::info('Payment account statuses were successfully updated after syncing.', [
-					'source'  => 'nft-checkout-payment-gateway',
-					'context' => ['updated_accounts' => $statusSummary],
-				]);
-			} else {
-				NFT_Checkout_Payment_Gateway_Logger::info('Payment accounts were checked, but no updates were necessary.', [
-					'source'  => 'nft-checkout-payment-gateway',
-					'context' => ['checked_accounts' => $statusSummary],
-				]);
+		// Every account we asked about must come back with an answer.
+		$unanswered = 0;
+		foreach ($sent as $entry) {
+			if (!isset($changes[$entry['mode'] . '|' . $entry['public_key']])) {
+				$changes[$entry['mode'] . '|' . $entry['public_key']] = ['status' => 'not_connected', 'only_if_unconfirmed' => true];
+				$unanswered++;
 			}
-		} else {
-			NFT_Checkout_Payment_Gateway_Logger::info('Sync completed. No account status data was returned from the server.', $logger_context);
 		}
 
+		$statusSummary = $this->nft_checkout_store_account_statuses($changes);
+
+		$this->last_sync = [
+			'ok'       => ($unanswered === 0),
+			'reason'   => ($unanswered === 0) ? '' : 'refused',
+			'statuses' => $statusSummary,
+		];
+
+		NFT_Checkout_Payment_Gateway_Logger::info('Payment account statuses checked with RT.', [
+			'source'  => 'nft-checkout-payment-gateway',
+			'context' => ['checked_accounts' => $statusSummary],
+		]);
+
+		// Account statuses are refreshed; now reconcile any order still waiting for payment.
 		$this->sync_pending_orders();
+
+		$this->nft_checkout_send_plugin_status(1, 1);
 
 		return $statusSummary;
 	}
 
 	/**
-	 * Sync all pending NFT Checkout orders with the remote payment API.
+	 * Result of the last account check in this request.
 	 *
-	 * @param int $limit Max number of pending orders to check per run.
-	 * @return array Summary of synced order statuses.
+	 * @var array
 	 */
-	public function sync_pending_orders($limit = 20)
+	private $last_sync = ['ok' => true, 'reason' => '', 'statuses' => []];
+
+	/**
+	 * Save new account statuses without touching anything else.
+	 *
+	 * The accounts option is read again here and only the status of an account
+	 * whose public key still matches is changed.
+	 *
+	 * @param array $changes "<mode>|<public key>" => ['status' => string, 'only_if_unconfirmed' => bool]
+	 * @return array Summary rows: title, mode, status.
+	 */
+	private function nft_checkout_store_account_statuses(array $changes)
+	{
+		$accounts = nft_checkout_get_accounts();
+		$summary  = [];
+		$updated  = false;
+
+		foreach ($accounts as &$account) {
+			if (!is_array($account)) {
+				continue;
+			}
+			$has_sandbox = isset($account['has_sandbox']) && $account['has_sandbox'] === 'on';
+			foreach (['live', 'sandbox'] as $mode) {
+				$public_key = (string) ($account[$mode . '_public_key'] ?? '');
+				$status_key = $mode . '_status';
+				$current    = strtolower((string) ($account[$status_key] ?? ''));
+
+				if ($public_key === '' || empty($account[$mode . '_secret_key']) || ($mode === 'sandbox' && !$has_sandbox)) {
+					$new = 'inactive';
+				} elseif (isset($changes[$mode . '|' . $public_key])) {
+					$change = $changes[$mode . '|' . $public_key];
+					// A failed check never takes a working account offline.
+					if (!empty($change['only_if_unconfirmed']) && $current === 'active') {
+						$new = $current;
+					} else {
+						$new = $change['status'];
+					}
+					$summary[] = [
+						'title'  => $account['title'] ?? '',
+						'mode'   => $mode,
+						'status' => $new,
+					];
+				} else {
+					continue;
+				}
+
+				if ($new !== $current || ($account[$status_key] ?? null) !== $new) {
+					$account[$status_key] = $new;
+					$updated = true;
+				}
+			}
+		}
+		unset($account);
+
+		if ($updated) {
+			update_option(NFT_CHECKOUT_ACCOUNTS_OPTION, $accounts, false);
+		}
+
+		return $summary;
+	}
+
+	/**
+	 * A plain sentence about the last account check, or '' when all is well
+	 * for the mode the shop is using.
+	 *
+	 * @param bool $is_sandbox Whether test mode is on.
+	 * @return string
+	 */
+	public function nft_checkout_last_sync_problem($is_sandbox)
+	{
+		$reason = $this->last_sync['reason'] ?? '';
+		if ($reason === 'unreachable') {
+			return __('Your settings were saved, but we could not reach RT to check your keys. Card payment stays hidden at checkout until the keys are checked. Press "Check with RT" to try again in a moment.', 'nft-checkout-payment-gateway');
+		}
+		if ($reason === 'no_keys' || $reason === 'no_accounts') {
+			return '';
+		}
+
+		$wanted = $is_sandbox ? 'sandbox' : 'live';
+		$bad    = [];
+		$seen   = false;
+		foreach ((array) ($this->last_sync['statuses'] ?? []) as $row) {
+			if (($row['mode'] ?? '') !== $wanted) {
+				continue;
+			}
+			$seen = true;
+			if (($row['status'] ?? '') !== 'active') {
+				$bad[] = (string) ($row['title'] ?? '');
+			}
+		}
+
+		if ($reason === 'refused' && !$seen) {
+			return __('We couldn\'t connect to RT with these keys. Check that the publishable and secret keys are from the same RT account and the same mode (Sandbox or Live).', 'nft-checkout-payment-gateway');
+		}
+		if (!empty($bad)) {
+			return sprintf(
+				/* translators: %s: account names */
+				__('We couldn\'t connect to RT with the keys for: %s. Check that the publishable and secret keys are from the same RT account and the same mode (Sandbox or Live). Card payment stays hidden at checkout until RT accepts the keys.', 'nft-checkout-payment-gateway'),
+				implode(', ', array_filter($bad))
+			);
+		}
+		if (!$seen) {
+			return $is_sandbox
+				? __('Test mode is on, but no account has sandbox keys. Add sandbox keys to an account, or turn test mode off.', 'nft-checkout-payment-gateway')
+				: __('No account has live keys yet. Add live keys to take real payments, or turn test mode on to try it with sandbox keys.', 'nft-checkout-payment-gateway');
+		}
+		return '';
+	}
+
+	/**
+	 * Sync every open NFT Checkout order with RT, in pages, within a time budget.
+	 *
+	 * @param int $max_orders  Upper bound of orders checked in this run.
+	 * @param int $time_budget Seconds this run may spend.
+	 * @return array Summary of synced order states keyed by order id.
+	 */
+	public function sync_pending_orders($max_orders = 300, $time_budget = 20)
 	{
 		if (!function_exists('wc_get_orders')) {
 			return [];
 		}
 
-		$orders = wc_get_orders([
-			'status'         => ['pending', 'on-hold'],
-			'payment_method' => ['nft-checkout', 'nft_checkout'],
-			'limit'          => absint($limit),
-			'orderby'        => 'date',
-			'order'          => 'DESC',
-		]);
+		$started   = microtime(true);
+		$page_size = 25;
+		$synced    = [];
+		$seen      = 0;
 
-		$synced = [];
-		if (!empty($orders) && is_array($orders)) {
-			foreach ($orders as $order) {
-				if ($order instanceof WC_Order) {
+		foreach (nft_checkout_gateway_ids() as $gateway_id) {
+			$page = 1;
+			while ($seen < $max_orders && (microtime(true) - $started) < $time_budget) {
+				$orders = wc_get_orders([
+					'status'         => ['pending', 'on-hold'],
+					'payment_method' => $gateway_id,
+					'limit'          => $page_size,
+					'page'           => $page,
+					'orderby'        => 'date',
+					'order'          => 'ASC',
+					'date_created'   => '>' . (time() - 30 * DAY_IN_SECONDS),
+				]);
+
+				if (empty($orders) || !is_array($orders)) {
+					break;
+				}
+
+				foreach ($orders as $order) {
+					if (!$order instanceof WC_Order) {
+						continue;
+					}
+					$seen++;
+					if ($seen > $max_orders || (microtime(true) - $started) >= $time_budget) {
+						break 2;
+					}
 					$last_attempt = (int) $order->get_meta('_nft_checkout_last_sync_attempt');
 					if ($last_attempt > 0 && (time() - $last_attempt) < 15) {
 						continue;
@@ -729,17 +585,292 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 						$synced[$order->get_id()] = $result;
 					}
 				}
+
+				if (count($orders) < $page_size) {
+					break;
+				}
+				$page++;
 			}
 		}
 
 		return $synced;
 	}
 
+	/* =========================================================
+	 * PAYMENT IDS
+	 * ========================================================= */
+
 	/**
-	 * Sync a single NFT Checkout order status with the remote payment API.
+	 * Every payment id this order is known under: current meta, the history of
+	 * every id RT reported for it, and the link table.
+	 *
+	 * @param WC_Order $order
+	 * @return string[]
+	 */
+	public function nft_checkout_known_order_pay_ids($order)
+	{
+		if (!$order instanceof WC_Order) {
+			return [];
+		}
+
+		$ids = [sanitize_text_field((string) $order->get_meta('_nft_checkout_pay_id'))];
+
+		$history = $order->get_meta('_nft_checkout_pay_id_history');
+		if (is_array($history)) {
+			foreach ($history as $entry) {
+				$ids[] = sanitize_text_field((string) (is_array($entry) ? ($entry['pay_id'] ?? '') : $entry));
+			}
+		}
+
+		$row = nft_checkout_get_order_payment_link($order->get_id());
+		if (is_array($row)) {
+			$ids[] = sanitize_text_field((string) ($row['uuid'] ?? ''));
+		}
+
+		return array_values(array_unique(array_filter($ids, static function ($id) {
+			return is_string($id) && $id !== '';
+		})));
+	}
+
+	/**
+	 * Record a payment id RT reported for the order through an authenticated
+	 * channel (a signed webhook or a signed lookup): meta, history and table.
+	 * Never called with an id taken from the customer's browser.
+	 *
+	 * @param WC_Order $order
+	 * @param string   $pay_id
+	 * @param array    $link   payment_link, customer_email, amount.
+	 */
+	public function nft_checkout_remember_pay_id($order, $pay_id, array $link = [])
+	{
+		$pay_id = sanitize_text_field((string) $pay_id);
+		if (!$order instanceof WC_Order || $pay_id === '') {
+			return;
+		}
+
+		$known = $this->nft_checkout_known_order_pay_ids($order);
+		$seen  = false;
+		foreach ($known as $id) {
+			if (nft_checkout_pay_ids_match($id, $pay_id)) {
+				$seen = true;
+				break;
+			}
+		}
+
+		$current = (string) $order->get_meta('_nft_checkout_pay_id');
+		if ($current === '') {
+			$order->update_meta_data('_nft_checkout_pay_id', $pay_id);
+		}
+
+		if (!$seen) {
+			$history = $order->get_meta('_nft_checkout_pay_id_history');
+			$history = is_array($history) ? $history : [];
+			$history[] = ['pay_id' => $pay_id, 'time' => current_time('mysql')];
+			$order->update_meta_data('_nft_checkout_pay_id_history', $history);
+			// The newest payment email now has its payment id.
+			$order->update_meta_data('_nft_checkout_latest_pay_id', $pay_id);
+			$order->delete_meta_data('_nft_checkout_voucher_awaiting_pay_id');
+		}
+		$order->save();
+
+		$payment_link = isset($link['payment_link']) && is_scalar($link['payment_link']) ? (string) $link['payment_link'] : '';
+		if ($payment_link === '') {
+			$variants = nft_checkout_pay_id_variants($pay_id);
+			$payment_link = $this->base_url . '/p/' . rawurlencode(end($variants) ?: $pay_id);
+		}
+
+		nft_checkout_store_order_payment_link($order, [
+			'uuid'           => $pay_id,
+			'payment_link'   => $payment_link,
+			'customer_email' => $link['customer_email'] ?? $order->get_billing_email(),
+			'amount'         => $link['amount'] ?? $order->get_total(),
+		]);
+	}
+
+	/* =========================================================
+	 * ORDER STATUS SYNC (NFT-03)
+	 * ========================================================= */
+
+	/**
+	 * Ask RT where an order's payment stands: one signed, merchant-bound call
+	 * (POST /update-txn-status with the order's account), nothing else. The
+	 * answer names the payment, its amount, currency, order and mode; the
+	 * order is marked paid only when every one of them matches it.
+	 *
+	 * @param WC_Order $order
+	 * @return array{state: string|null, reason: string|null, data: array|null}
+	 */
+	public function nft_checkout_refresh_order_from_remote($order)
+	{
+		$order_id   = $order->get_id();
+		$log_prefix = "[Order #{$order_id}] Sync |";
+		$ctx        = ['source' => 'nft-checkout-payment-gateway'];
+		$out        = ['state' => null, 'reason' => null, 'data' => null];
+
+		$account = nft_checkout_get_order_account($order);
+		if ($account === null || $account['public_key'] === '' || $account['secret_key'] === '') {
+			NFT_Checkout_Payment_Gateway_Logger::warning("{$log_prefix} The order names no configured merchant account; status cannot be verified", $ctx);
+			$out['reason'] = 'no_account';
+			return $out;
+		}
+
+		$known_ids = $this->nft_checkout_known_order_pay_ids($order);
+
+		$payload = [
+			'order_id'   => (string) $order_id,
+			'is_sandbox' => (int) $account['is_sandbox'],
+		];
+		/*
+		 * NFT-01: ask about the newest payment, not the first one. While the
+		 * order is waiting to learn the id of a payment email it just sent, no
+		 * id is named, so RT answers for the order's newest payment link.
+		 */
+		$awaiting_new_id = (string) $order->get_meta('_nft_checkout_voucher_awaiting_pay_id') !== '';
+		$lookup_id       = '';
+		if (!$awaiting_new_id && !empty($known_ids)) {
+			$lookup_id = (string) $order->get_meta('_nft_checkout_latest_pay_id');
+			if ($lookup_id === '') {
+				$lookup_id = (string) end($known_ids);
+			}
+		}
+		if ($lookup_id !== '') {
+			$payload['payment_token'] = $lookup_id;
+		}
+		$raw_body = wp_json_encode($payload);
+
+		$response = wp_remote_post(esc_url_raw($this->get_api_url('/update-txn-status')), [
+			'headers'   => nft_checkout_signed_headers($account['public_key'], $account['secret_key'], $raw_body),
+			'body'      => $raw_body,
+			'timeout'   => 8,
+			'sslverify' => true,
+		]);
+
+		if (is_wp_error($response)) {
+			NFT_Checkout_Payment_Gateway_Logger::warning("{$log_prefix} API connection failed", $ctx);
+			$out['reason'] = 'network';
+			return $out;
+		}
+
+		$http_code = (int) wp_remote_retrieve_response_code($response);
+		$data      = json_decode(wp_remote_retrieve_body($response), true);
+
+		if ($http_code === 401 || $http_code === 403) {
+			NFT_Checkout_Payment_Gateway_Logger::warning("{$log_prefix} API authentication failed; verify the merchant account keys", $ctx);
+			$out['reason'] = 'auth';
+			return $out;
+		}
+
+		if ($http_code < 200 || $http_code >= 300 || !is_array($data)) {
+			NFT_Checkout_Payment_Gateway_Logger::info("{$log_prefix} No usable status from RT (HTTP {$http_code})", $ctx);
+			$out['reason'] = 'upstream';
+			return $out;
+		}
+
+		if (empty($data['status'])) {
+			// RT knows no payment link for this order yet: the customer has not
+			// opened their voucher. Nothing to apply.
+			$out['reason'] = 'no_payment';
+			return $out;
+		}
+
+		$out['data'] = $data;
+
+		$pay_id = sanitize_text_field((string) ($data['pay_id'] ?? ''));
+
+		// The link must have been raised by THIS shop: RT answers with the return
+		// URL the voucher registered, which names this site.
+		$redirect_url = isset($data['redirect_url']) && is_string($data['redirect_url']) ? $data['redirect_url'] : '';
+		if ($redirect_url !== '') {
+			$link_host = strtolower((string) wp_parse_url($redirect_url, PHP_URL_HOST));
+			$site_host = strtolower((string) wp_parse_url(home_url(), PHP_URL_HOST));
+			if ($link_host === '' || $link_host !== $site_host) {
+				$this->nft_checkout_note_sync_mismatch($order, 'the payment link belongs to another site.');
+				$out['reason'] = 'claim_mismatch';
+				return $out;
+			}
+		}
+
+		$payment_status = NFT_Checkout_Payment_State_Engine::map_status($data['payment_status'] ?? null);
+		$txn_status     = NFT_Checkout_Payment_State_Engine::map_status($data['transaction_status'] ?? null);
+		$settled        = isset($data['settled']) && filter_var($data['settled'], FILTER_VALIDATE_BOOLEAN);
+
+		if ($settled || $payment_status === 'success') {
+			$state = 'success';
+		} elseif ($payment_status === 'pending' || $payment_status === null) {
+			$state = ($txn_status === 'processing' || $txn_status === 'success') ? 'processing' : 'pending';
+		} else {
+			$state = $payment_status;
+		}
+
+		NFT_Checkout_Payment_Gateway_Logger::info("{$log_prefix} RT reports '{$state}'", array_merge($ctx, ['pay_id' => $pay_id]));
+
+		$out['state'] = $state;
+
+		if ($state === 'success') {
+			$claim = nft_checkout_verify_payment_claim(
+				$order,
+				$data,
+				$pay_id,
+				$known_ids,
+				true,
+				(int) $account['is_sandbox'],
+				nft_checkout_may_learn_new_pay_id($order, $data)
+			);
+			if (is_wp_error($claim)) {
+				$this->nft_checkout_note_sync_mismatch($order, $claim->get_error_message());
+				$out['state']  = null;
+				$out['reason'] = 'claim_mismatch';
+				return $out;
+			}
+			$this->nft_checkout_remember_pay_id($order, $pay_id, [
+				'customer_email' => $order->get_billing_email(),
+				'amount'         => $data['amount'] ?? $order->get_total(),
+			]);
+		} elseif ($pay_id !== '' && (empty($known_ids) || $awaiting_new_id)) {
+			// An open link RT raised for this order: remember it so later
+			// webhooks and checks are matched against it.
+			$this->nft_checkout_remember_pay_id($order, $pay_id, [
+				'customer_email' => $order->get_billing_email(),
+				'amount'         => $data['amount'] ?? $order->get_total(),
+			]);
+		}
+
+		if ($state === 'returned') {
+			$out['state'] = null;
+			return $out;
+		}
+
+		// RT answered about an older payment link while the shopper has a newer
+		// one: that link closing must not fail the order.
+		if (
+			in_array($state, ['failed', 'cancelled', 'expired'], true) &&
+			nft_checkout_is_superseded_pay_id($order, $pay_id, $known_ids)
+		) {
+			$out['state']  = 'pending';
+			$out['reason'] = 'older_link';
+			return $out;
+		}
+
+		$result = NFT_Checkout_Payment_State_Engine::handle_event(
+			$order_id,
+			'api_sync',
+			[
+				'status'        => $state,
+				'payment_token' => $pay_id !== '' ? $pay_id : ($lookup_id !== '' ? $lookup_id : ($known_ids[0] ?? '')),
+				'source'        => 'API Sync',
+			]
+		);
+
+		NFT_Checkout_Payment_Gateway_Logger::info("{$log_prefix} Engine result: " . wp_json_encode($result), $ctx);
+
+		return $out;
+	}
+
+	/**
+	 * Sync a single NFT Checkout order status with RT.
 	 *
 	 * @param WC_Order|int $order Order instance or order ID.
-	 * @return string|null Resolved state ('success', 'failed', 'cancelled', 'expired', 'processing') or null.
+	 * @return string|null 'success', 'failed', 'cancelled', 'expired', 'processing', 'pending' or null.
 	 */
 	public function sync_single_order_status($order)
 	{
@@ -747,12 +878,7 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 			$order = wc_get_order(absint($order));
 		}
 
-		if (!$order instanceof WC_Order) {
-			return null;
-		}
-
-		$payment_method = $order->get_payment_method();
-		if ($payment_method !== 'nft-checkout' && $payment_method !== 'nft_checkout') {
+		if (!$order instanceof WC_Order || !nft_checkout_is_gateway_order($order)) {
 			return null;
 		}
 
@@ -760,297 +886,31 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 			return 'success';
 		}
 
-		$order_id = $order->get_id();
-		$pay_id   = sanitize_text_field((string) $order->get_meta('_nft_checkout_pay_id'));
+		$outcome = $this->nft_checkout_refresh_order_from_remote($order);
 
-		// Resolve order merchant account credentials
-		$accounts_data = get_option('woocommerce_nft-checkout_payment_gateway_accounts') ?: get_option('woocommerce_unified_payment_gateway_accounts', []);
-		if (is_string($accounts_data)) {
-			$accounts_data = maybe_unserialize($accounts_data);
-		}
-		if (isset($accounts_data['live_public_key']) || isset($accounts_data['sandbox_public_key'])) {
-			$accounts_data = [$accounts_data];
-		}
+		return $outcome['state'] ?? null;
+	}
 
-		$settings   = get_option('woocommerce_nft-checkout_settings') ?: get_option('woocommerce_nft_checkout_settings', []);
-		$is_sandbox = isset($settings['sandbox']) && $settings['sandbox'] === 'yes';
+	/**
+	 * Record (once) why an RT "paid" status was not applied to the order.
+	 */
+	private function nft_checkout_note_sync_mismatch($order, $detail)
+	{
+		NFT_Checkout_Payment_Gateway_Logger::warning(
+			'[Order #' . $order->get_id() . '] Sync | RT reports paid but ' . $detail . ' Order left unchanged for manual review.',
+			['source' => 'nft-checkout-payment-gateway']
+		);
 
-		$order_account_uid    = (string) $order->get_meta('_nft_checkout_account_unique_id');
-		$order_account_pubkey = (string) $order->get_meta('_nft_checkout_account_public_key');
-
-		$matched_account = null;
-		if (is_array($accounts_data)) {
-			foreach ($accounts_data as $acc) {
-				if (!is_array($acc)) {
-					continue;
-				}
-				if (!empty($order_account_uid) && isset($acc['unique_id']) && $acc['unique_id'] === $order_account_uid) {
-					$matched_account = $acc;
-					break;
-				}
-				$acc_pub = $is_sandbox ? ($acc['sandbox_public_key'] ?? '') : ($acc['live_public_key'] ?? '');
-				if (!empty($order_account_pubkey) && $acc_pub === $order_account_pubkey) {
-					$matched_account = $acc;
-					break;
-				}
-			}
-		}
-
-		$target_account = $matched_account ?: (is_array($accounts_data) ? reset($accounts_data) : null);
-		$public_key     = '';
-		$secret_key     = '';
-		if (is_array($target_account)) {
-			$public_key = $is_sandbox ? ($target_account['sandbox_public_key'] ?? '') : ($target_account['live_public_key'] ?? '');
-			$secret_key = $is_sandbox ? ($target_account['sandbox_secret_key'] ?? '') : ($target_account['live_secret_key'] ?? '');
-		}
-
-		// If pay_id is missing, attempt to resolve from purchase URL, voucher id, or reference
-		if (empty($pay_id)) {
-			$purchase_url = (string) $order->get_meta('_nft_checkout_voucher_purchase_url');
-			if (!empty($purchase_url)) {
-				$pay_id = $this->resolve_pay_id_from_purchase_url($purchase_url);
-			}
-
-			if (empty($pay_id)) {
-				$voucher_id = (string) $order->get_meta('_nft_checkout_voucher_id');
-				if (!empty($voucher_id)) {
-					$redeem_url = $this->get_api_url('/voucher/redeem/' . $voucher_id);
-					$res = wp_remote_post($redeem_url, [
-						'headers' => ['Content-Type' => 'application/json'],
-						'body'    => wp_json_encode(['voucher_id' => $voucher_id]),
-						'timeout' => 8,
-					]);
-					if (!is_wp_error($res) && wp_remote_retrieve_response_code($res) === 200) {
-						$r_data = json_decode(wp_remote_retrieve_body($res), true);
-						$plink  = $r_data['data']['payment_link'] ?? '';
-						if (!empty($plink) && preg_match('#/p/(?:t/)?([a-zA-Z0-9_\-]+)#', $plink, $pm)) {
-							$pay_id = $pm[1];
-						}
-					}
-				}
-			}
-
-			if (empty($pay_id) && function_exists('nft_checkout_get_order_payment_link')) {
-				$link_row = nft_checkout_get_order_payment_link($order_id);
-				if (!empty($link_row->uuid)) {
-					$pay_id = sanitize_text_field($link_row->uuid);
-				}
-			}
-
-			if (!empty($pay_id)) {
-				$order->update_meta_data('_nft_checkout_pay_id', $pay_id);
-				$order->save();
-			}
-		}
-
-		$status_data = null;
-
-		// 1. PRIMARY: Query Rethink Pay /payment-requests/public/{pay_id}/status with signed HMAC
-		if (!empty($pay_id) && !empty($public_key) && !empty($secret_key)) {
-			$timestamp    = (string) time();
-			$hmac_headers = [
-				'Authorization' => 'Bearer ' . sanitize_text_field($public_key),
-				'X-Timestamp'   => $timestamp,
-				'X-Signature'   => hash_hmac('sha256', $timestamp . '.' . $pay_id, $secret_key),
-			];
-			$status_url  = $this->get_api_url('/payment-requests/public/' . rawurlencode($pay_id) . '/status');
-			$status_resp = wp_remote_get(esc_url_raw($status_url), [
-				'headers'   => $hmac_headers,
-				'timeout'   => 8,
-				'sslverify' => true,
-			]);
-			if (!is_wp_error($status_resp) && (int) wp_remote_retrieve_response_code($status_resp) === 200) {
-				$temp_data = json_decode(wp_remote_retrieve_body($status_resp), true);
-				if (is_array($temp_data) && (isset($temp_data['payment_status']) || isset($temp_data['settled']))) {
-					$status_data = $temp_data;
-				}
-			}
-		}
-
-		// 2. FALLBACK: /api/check-payment-status
-		if (!$status_data || (!isset($status_data['payment_status']) && !isset($status_data['settled']) && empty($status_data['status']))) {
-			if (!empty($pay_id)) {
-				$check_res = wp_remote_post($this->get_api_url('/api/check-payment-status'), [
-					'headers' => [
-						'Content-Type' => 'application/json',
-						'Accept'       => 'application/json',
-					],
-					'body'    => wp_json_encode(['uuid' => $pay_id]),
-					'timeout' => 8,
-				]);
-				if (!is_wp_error($check_res) && (int) wp_remote_retrieve_response_code($check_res) === 200) {
-					$temp_check = json_decode(wp_remote_retrieve_body($check_res), true);
-					if (is_array($temp_check) && (isset($temp_check['payment_status']) || isset($temp_check['status']))) {
-						$status_data = $temp_check;
-					}
-				}
-			}
-		}
-
-		// 3. FALLBACK: /api/update-txn-status
-		if (!$status_data || (!isset($status_data['payment_status']) && !isset($status_data['settled']) && empty($status_data['status']))) {
-			$headers = [
-				'Content-Type' => 'application/json',
-				'Accept'       => 'application/json',
-			];
-			if (!empty($public_key)) {
-				$headers['Authorization'] = 'Bearer ' . sanitize_text_field($public_key);
-			}
-			$txn_res = wp_remote_post($this->get_api_url('/api/update-txn-status'), [
-				'headers' => $headers,
-				'body'    => wp_json_encode([
-					'order_id'      => $order_id,
-					'payment_token' => $pay_id,
-				]),
-				'timeout' => 8,
-			]);
-			if (!is_wp_error($txn_res) && (int) wp_remote_retrieve_response_code($txn_res) === 200) {
-				$temp_txn = json_decode(wp_remote_retrieve_body($txn_res), true);
-				if (is_array($temp_txn) && (!empty($temp_txn['payment_status']) || !empty($temp_txn['transaction_status']) || (isset($temp_txn['status']) && is_string($temp_txn['status'])))) {
-					$status_data = $temp_txn;
-				}
-			}
-		}
-
-		if (!is_array($status_data)) {
-			return null;
-		}
-
-		$payment_status = strtolower(sanitize_text_field((string) ($status_data['payment_status'] ?? $status_data['transaction_status'] ?? (is_string($status_data['status'] ?? null) ? $status_data['status'] : ''))));
-		$settled        = !empty($status_data['settled']);
-		$failed         = !empty($status_data['failed']);
-		$tx_status      = strtolower(sanitize_text_field((string) ($status_data['transaction']['status'] ?? '')));
-		$tx_ref         = sanitize_text_field((string) ($status_data['transaction']['reference'] ?? ($status_data['reference'] ?? '')));
-
-		if (!empty($tx_ref)) {
-			$order->update_meta_data('_nft_checkout_transaction_reference', $tx_ref);
-		}
-
-		$is_paid = $settled
-			|| in_array($payment_status, ['success', 'paid', 'completed'], true)
-			|| in_array($tx_status, ['success', 'paid', 'completed'], true);
-
-		// If not paid with current pay_id, re-check using purchase_url in case reference changed
-		if (!$is_paid) {
-			$purchase_url = (string) $order->get_meta('_nft_checkout_voucher_purchase_url');
-			if (!empty($purchase_url)) {
-				$resolved_pay_id = $this->resolve_pay_id_from_purchase_url($purchase_url);
-				if (!empty($resolved_pay_id) && $resolved_pay_id !== $pay_id) {
-					$alt_timestamp = (string) time();
-					$alt_status_url = $this->get_api_url('/payment-requests/public/' . rawurlencode($resolved_pay_id) . '/status');
-					$alt_res = wp_remote_get(esc_url_raw($alt_status_url), [
-						'headers' => [
-							'Authorization' => 'Bearer ' . sanitize_text_field($public_key),
-							'X-Timestamp'   => $alt_timestamp,
-							'X-Signature'   => hash_hmac('sha256', $alt_timestamp . '.' . $resolved_pay_id, $secret_key),
-						],
-						'timeout' => 8,
-					]);
-					if (!is_wp_error($alt_res) && (int) wp_remote_retrieve_response_code($alt_res) === 200) {
-						$alt_data = json_decode(wp_remote_retrieve_body($alt_res), true);
-						$alt_settled = !empty($alt_data['settled']);
-						$alt_raw = strtolower(sanitize_text_field((string) ($alt_data['payment_status'] ?? $alt_data['transaction']['status'] ?? '')));
-						if ($alt_settled || in_array($alt_raw, ['success', 'paid', 'completed'], true)) {
-							$pay_id = $resolved_pay_id;
-							$order->update_meta_data('_nft_checkout_pay_id', $pay_id);
-							$order->save();
-							$is_paid = true;
-							$payment_status = 'success';
-							$status_data = $alt_data;
-						}
-					}
-				}
-			}
-		}
-
-		if ($is_paid) {
-			$raw_amount   = $status_data['amount'] ?? ($status_data['data']['amount'] ?? null);
-			$raw_currency = $status_data['currency'] ?? ($status_data['curr_code'] ?? ($status_data['data']['currency'] ?? ($status_data['data']['curr_code'] ?? null)));
-			$raw_order_id = $status_data['order_id'] ?? ($status_data['meta_data']['order_id'] ?? ($status_data['data']['order_id'] ?? ($status_data['data']['meta_data']['order_id'] ?? null)));
-
-			if ($raw_order_id !== null && $raw_order_id !== '' && (int) $raw_order_id !== (int) $order_id) {
-				NFT_Checkout_Payment_Gateway_Logger::warning(
-					"API sync order_id mismatch for order #{$order_id}: expected {$order_id}, got " . sanitize_text_field((string) $raw_order_id),
-					['source' => 'nft-checkout-payment-gateway']
-				);
-				return null;
-			}
-
-			if (!empty($raw_currency)) {
-				$api_currency   = strtoupper(trim(sanitize_text_field((string) $raw_currency)));
-				$order_currency = strtoupper(trim((string) $order->get_currency()));
-				if ($api_currency !== $order_currency) {
-					NFT_Checkout_Payment_Gateway_Logger::warning(
-						"API sync currency mismatch for order #{$order_id}: order currency {$order_currency} vs API {$api_currency}",
-						['source' => 'nft-checkout-payment-gateway']
-					);
-				}
-			}
-
-			if ($raw_amount !== null && $raw_amount !== '') {
-				$api_amount   = (float) $raw_amount;
-				$order_amount = (float) $order->get_total();
-				if (abs($api_amount - $order_amount) > 0.05) {
-					NFT_Checkout_Payment_Gateway_Logger::warning(
-						"API sync amount mismatch for order #{$order_id}: order total {$order_amount} vs API {$api_amount}",
-						['source' => 'nft-checkout-payment-gateway']
-					);
-				}
-			}
-
-			if (function_exists('nft_checkout_store_order_payment_link') && !empty($pay_id)) {
-				nft_checkout_store_order_payment_link($order, [
-					'uuid'           => $pay_id,
-					'payment_link'   => $this->base_url . '/p/' . $pay_id,
-					'customer_email' => $order->get_billing_email(),
-					'amount'         => $order->get_total(),
-				]);
-			}
-
-			NFT_Checkout_Payment_State_Engine::handle_event(
-				$order_id,
-				'api_sync',
-				[
-					'status'        => 'success',
-					'payment_token' => $pay_id,
-					'source'        => 'API Sync',
-				]
+		if (!$order->get_meta('_nft_checkout_sync_mismatch_noted')) {
+			$order->add_order_note(
+				'<strong>NFT Checkout</strong><br><br>' .
+				esc_html__('RT reports this payment as completed, but the details do not match the order:', 'nft-checkout-payment-gateway') .
+				' ' . esc_html($detail) . '<br>' .
+				esc_html__('The order was not changed. Check the payment in your RT account before shipping.', 'nft-checkout-payment-gateway')
 			);
-
-			if (!empty($pay_id)) {
-				wp_remote_post($this->get_api_url('/api/payment/sync-status'), [
-					'headers' => [
-						'Content-Type' => 'application/json',
-						'Accept'       => 'application/json',
-					],
-					'body'    => wp_json_encode([
-						'pay_id'          => $pay_id,
-						'wp_order_status' => $order->get_status(),
-						'synced_via'      => 'plugin_sync',
-					]),
-					'timeout' => 5,
-				]);
-			}
-
-			return 'success';
+			$order->update_meta_data('_nft_checkout_sync_mismatch_noted', 'yes');
+			$order->save();
 		}
-
-		if ($failed || in_array($payment_status, ['failed', 'cancelled', 'canceled', 'expired'], true)) {
-			$resolved_fail = $failed ? 'failed' : $payment_status;
-			NFT_Checkout_Payment_State_Engine::handle_event(
-				$order_id,
-				'api_sync',
-				[
-					'status'        => $resolved_fail,
-					'payment_token' => $pay_id,
-					'source'        => 'API Sync',
-				]
-			);
-
-			return $resolved_fail;
-		}
-
-		return 'processing';
 	}
 
 	function nft_checkout_manual_sync_callback()
@@ -1060,65 +920,77 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 		if (!check_ajax_referer('nft_checkout_sync_nonce', 'nonce', false)) {
 			NFT_Checkout_Payment_Gateway_Logger::error('Security validation failed during manual sync.', $logger_context);
 			wp_send_json_error([
-				'message' => __('Security check failed. Please refresh the page and try again.', 'nft-checkout-payment-gateway')
+				'message' => __('This page was open for too long. Refresh the page and try again.', 'nft-checkout-payment-gateway')
 			], 400);
-			wp_die();
 		}
 
 		// Check user capabilities
 		if (!current_user_can('manage_woocommerce')) {
 			NFT_Checkout_Payment_Gateway_Logger::error('Unauthorized manual sync attempt by user ID: ' . get_current_user_id(), $logger_context);
 			wp_send_json_error([
-				'message' => __('You do not have permission to perform this action.', 'nft-checkout-payment-gateway')
+				'message' => __('You do not have permission to do this. Ask the shop owner or an administrator.', 'nft-checkout-payment-gateway')
 			], 403);
-			wp_die();
 		}
 
 		NFT_Checkout_Payment_Gateway_Logger::info("Payment accounts sync initiated", $logger_context);
 
 		try {
 			ob_start();
-
 			$statusSummary = $this->handle_cron_event();
 			$output = ob_get_clean();
 
 			if (!empty($output)) {
-				NFT_Checkout_Payment_Gateway_Logger::warning('Unexpected output generated during sync: ' . $output, $logger_context);
+				NFT_Checkout_Payment_Gateway_Logger::warning('Unexpected output generated during sync.', $logger_context);
 			}
-
-			NFT_Checkout_Payment_Gateway_Logger::info('Payment accounts sync completed successfully.', $logger_context);
-
-			wp_send_json_success([
-				'message'  => __('Payment accounts synchronized successfully.', 'nft-checkout-payment-gateway'),
-				'timestamp' => current_time('mysql'),
-				'statuses' => $statusSummary
-			]);
-		} catch (Exception $e) {
+		} catch (\Throwable $e) {
+			if (ob_get_level() > 0) {
+				ob_end_clean();
+			}
 			NFT_Checkout_Payment_Gateway_Logger::error('Payment accounts sync failed: ' . $e->getMessage(), $logger_context);
 			wp_send_json_error([
-				'message' => __('Sync failed: ', 'nft-checkout-payment-gateway') . $e->getMessage(),
-				'code'    => $e->getCode()
+				'message' => __('Something went wrong while checking your keys with RT. Try again in a moment. If it keeps happening, contact RT support.', 'nft-checkout-payment-gateway'),
 			], 500);
 		}
 
-		wp_die(); // Always include this
+		$reason = $this->last_sync['reason'] ?? '';
+		if ($reason === 'no_accounts' || $reason === 'no_keys') {
+			wp_send_json_error([
+				'message'  => __('There are no saved keys to check. Add a payment account, paste your keys and press Save changes first.', 'nft-checkout-payment-gateway'),
+				'statuses' => [],
+			], 200);
+		}
+
+		$problem = $this->nft_checkout_last_sync_problem(nft_checkout_is_sandbox());
+		if ($problem !== '') {
+			NFT_Checkout_Payment_Gateway_Logger::warning('Payment accounts sync finished with a problem.', array_merge($logger_context, ['reason' => $reason]));
+			wp_send_json_error([
+				'message'  => ($reason === 'unreachable')
+					? __('We could not reach RT. Check your internet connection and try again in a moment.', 'nft-checkout-payment-gateway')
+					: $problem,
+				'statuses' => $statusSummary,
+			], 200);
+		}
+
+		NFT_Checkout_Payment_Gateway_Logger::info('Payment accounts sync completed successfully.', $logger_context);
+
+		wp_send_json_success([
+			'message'   => __('RT accepted your keys. Shoppers can pay by card.', 'nft-checkout-payment-gateway'),
+			'timestamp' => current_time('mysql'),
+			'statuses'  => $statusSummary,
+		]);
 	}
 
+	/**
+	 * NFT-17: tell RT the plugin's status (domain, versions, account titles and
+	 * public keys). Only when the merchant has opted in and has entered keys.
+	 */
 	public function nft_checkout_send_plugin_status($plugin_status, $gateway_loaded)
 	{
-		$accounts = get_option('woocommerce_nft-checkout_payment_gateway_accounts') ?: get_option('woocommerce_unified_payment_gateway_accounts', []);
-		if (empty($accounts)) {
-			$accounts = get_option('woocommerce_nft-checkout_payment_gateway_accounts') ?: get_option('woocommerce_unified_payment_gateway_accounts', []);
-		}
-
-		if (is_string($accounts)) {
-			$unserialized = maybe_unserialize($accounts);
-			$accounts = is_array($unserialized) ? $unserialized : [];
-		}
-
-		if (empty($accounts) || !is_array($accounts)) {
+		if (!nft_checkout_telemetry_allowed() || !nft_checkout_is_configured()) {
 			return;
 		}
+
+		$accounts = nft_checkout_get_accounts();
 
 		// Find first available public key
 		$public_key = '';
@@ -1136,18 +1008,10 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 		}
 
 		if (empty($public_key)) {
-			NFT_Checkout_Payment_Gateway_Logger::error(
-				'Unable to send plugin status. No public key found.',
-				[
-					'source' => 'nft-checkout-payment-gateway',
-				]
-			);
 			return;
 		}
 
-		global $wp_version;
-
-		// NFT-03: Strip secret keys from telemetry
+		// Never the secrets.
 		$safe_accounts = array_map(function($acc) {
 			unset($acc['live_secret_key'], $acc['sandbox_secret_key'], $acc['secret_key']);
 			return $acc;
@@ -1158,20 +1022,18 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 			'plugin_status'          => (int) $plugin_status,
 			'gateway_loaded'         => (int) $gateway_loaded,
 			'plugin_version'         => NFT_CHECKOUT_PLUGIN_VERSION,
-			'wordpress_version'      => $wp_version,
-			'woocommerce_version'    => class_exists('WooCommerce') && function_exists('WC')
-				? WC()->version
-				: '',
+			'wordpress_version'      => get_bloginfo('version'),
+			'woocommerce_version'    => class_exists('WooCommerce') && function_exists('WC') ? WC()->version : '',
 			'woocommerce_db_version' => get_option('woocommerce_db_version'),
-			'group_id'               => get_option('nft_checkout_group_id') ?: get_option('unified_group_id'),
+			'group_id'               => get_option('nft_checkout_group_id'),
 			'domain_name'            => wp_parse_url(home_url(), PHP_URL_HOST),
 		];
 
 		$response = wp_remote_post(
-			$this->get_api_url('/plugin/check/plugin'),
+			esc_url_raw($this->get_api_url('/plugin/check/plugin')),
 			[
 				'method'    => 'POST',
-				'timeout'   => 30,
+				'timeout'   => 10,
 				'sslverify' => true,
 				'headers'   => [
 					'Content-Type'  => 'application/json',
@@ -1184,18 +1046,13 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 		if (is_wp_error($response)) {
 			NFT_Checkout_Payment_Gateway_Logger::error(
 				'Plugin status API call failed.',
-				[
-					'source'  => 'nft-checkout-payment-gateway',
-					'context' => [
-						'error' => $response->get_error_message(),
-					],
-				]
+				['source' => 'nft-checkout-payment-gateway', 'error' => $response->get_error_message()]
 			);
 			return;
 		}
 
 		NFT_Checkout_Payment_Gateway_Logger::info(
-			'Plugin status updated successfully.',
+			'Plugin status sent.',
 			[
 				'source'  => 'nft-checkout-payment-gateway',
 				'context' => [
@@ -1207,279 +1064,174 @@ class NFT_CHECKOUT_PAYMENT_GATEWAY_Loader
 		);
 	}
 
+	/* =========================================================
+	 * AUTOMATIC SYNC TRIGGERS (ADMIN + CUSTOMER)
+	 * ========================================================= */
+
 	/**
-	 * Resolve pay_id (UUID) from a purchase/redeem URL.
+	 * NFT-15: queue a status refresh for an order instead of calling RT while
+	 * an admin page renders. Action Scheduler when WooCommerce provides it,
+	 * else a WP-Cron single event.
 	 *
-	 * @param string $purchase_url
-	 * @return string|null
+	 * @param int $order_id
 	 */
-	public function resolve_pay_id_from_purchase_url($purchase_url)
+	public function nft_checkout_schedule_async_sync($order_id)
 	{
-		if (empty($purchase_url)) {
-			return null;
-		}
-
-		// Direct pattern match for existing pay_id / UUID in URL
-		if (preg_match('#/p/(?:t/)?([a-zA-Z0-9_\-]+)#', $purchase_url, $m)) {
-			return $m[1];
-		}
-		if (preg_match('#[?&](?:uuid|pay_id)=([a-zA-Z0-9_\-]+)#', $purchase_url, $m)) {
-			return $m[1];
-		}
-
-		// When the URL is a voucher redeem link, query the redeem API
-		// e.g. https://qa.rt.app/voucher/redeem/{voucher_id}?signature={sig}
-		if (preg_match('#/voucher/redeem/([a-zA-Z0-9_\-]+)#', $purchase_url, $vm)) {
-			$voucher_id = $vm[1];
-			$signature  = '';
-			if (preg_match('#[?&]signature=([a-zA-Z0-9_\-]+)#', $purchase_url, $sm)) {
-				$signature = $sm[1];
-			}
-			$redeem_api_url = $this->get_api_url('/voucher/redeem/' . $voucher_id);
-			if (!empty($signature)) {
-				$redeem_api_url = add_query_arg(['signature' => $signature], $redeem_api_url);
-			}
-			$redeem_res = wp_remote_post($redeem_api_url, [
-				'headers' => [
-					'Content-Type' => 'application/json',
-					'Accept'       => 'application/json',
-				],
-				'body'    => wp_json_encode([
-					'voucher_id' => $voucher_id,
-					'signature'  => $signature,
-				]),
-				'timeout' => 8,
-			]);
-			if (!is_wp_error($redeem_res) && (int) wp_remote_retrieve_response_code($redeem_res) === 200) {
-				$redeem_data = json_decode(wp_remote_retrieve_body($redeem_res), true);
-				$link = $redeem_data['data']['payment_link'] ?? '';
-				if (!empty($link) && preg_match('#/p/(?:t/)?([a-zA-Z0-9_\-]+)#', $link, $lm)) {
-					return $lm[1];
-				}
-			}
-		}
-
-		// HTTP redirect fallback
-		$resp = wp_remote_get($purchase_url, [
-			'redirection' => 5,
-			'timeout'     => 8,
-		]);
-		if (!is_wp_error($resp)) {
-			$target_url = (string) wp_remote_retrieve_header($resp, 'location');
-			$http_response = $resp['http_response'] ?? null;
-			if (empty($target_url) && $http_response && is_object($http_response)) {
-				$raw_obj = $http_response->get_response_object();
-				if (is_object($raw_obj)) {
-					$target_url = (string) ($raw_obj->url ?? '');
-					if (empty($target_url) && !empty($raw_obj->history)) {
-						$last = end($raw_obj->history);
-						$target_url = (string) ($last->headers['location'] ?? '');
-					}
-				}
-			}
-			if (!empty($target_url)) {
-				if (preg_match('#/p/(?:t/)?([a-zA-Z0-9_\-]+)#', $target_url, $m)) {
-					return $m[1];
-				}
-				if (preg_match('#[?&](?:uuid|pay_id)=([a-zA-Z0-9_\-]+)#', $target_url, $m)) {
-					return $m[1];
-				}
-			}
-		}
-
-		return null;
-	}
-
-	public function nft_checkout_admin_order_sync_on_view($order)
-	{
-		if (!$order instanceof WC_Order) {
+		$order_id = absint($order_id);
+		if ($order_id <= 0) {
 			return;
 		}
-		$method = $order->get_payment_method();
-		if ($method !== 'nft-checkout' && $method !== 'nft_checkout') {
+		if (function_exists('as_enqueue_async_action')) {
+			if (function_exists('as_has_scheduled_action') && as_has_scheduled_action(NFT_CHECKOUT_ASYNC_SYNC_HOOK, [$order_id], 'rt-nft-checkout')) {
+				return;
+			}
+			as_enqueue_async_action(NFT_CHECKOUT_ASYNC_SYNC_HOOK, [$order_id], 'rt-nft-checkout');
+			return;
+		}
+		if (!wp_next_scheduled(NFT_CHECKOUT_ASYNC_SYNC_HOOK, [$order_id])) {
+			wp_schedule_single_event(time(), NFT_CHECKOUT_ASYNC_SYNC_HOOK, [$order_id]);
+		}
+	}
+
+	/**
+	 * Queue a refresh when an admin opens a pending order's edit screen.
+	 */
+	public function nft_checkout_admin_order_sync_on_view($order)
+	{
+		if (!$order instanceof WC_Order || !nft_checkout_is_gateway_order($order)) {
 			return;
 		}
 		if (!$order->has_status(['pending', 'on-hold'])) {
 			return;
 		}
 		$last_sync = (int) $order->get_meta('_nft_checkout_last_admin_sync');
-		if (time() - $last_sync < 15) {
+		if (time() - $last_sync < 60) {
 			return;
 		}
 		$order->update_meta_data('_nft_checkout_last_admin_sync', time());
 		$order->save();
-		$this->sync_single_order_status($order);
+
+		$this->nft_checkout_schedule_async_sync($order->get_id());
 	}
 
 	/**
 	 * Add custom order action in WooCommerce order edit screen.
 	 *
-	 * @param array $actions
+	 * @param array         $actions
+	 * @param WC_Order|null $order
 	 * @return array
 	 */
-	public function nft_checkout_add_order_actions($actions)
+	public function nft_checkout_add_order_actions($actions, $order = null)
 	{
-		global $theorder;
-		if ($theorder instanceof WC_Order) {
-			$method = $theorder->get_payment_method();
-			if ($method === 'nft-checkout' || $method === 'nft_checkout') {
-				$actions['nft_checkout_check_status'] = __('Check NFT Checkout payment status', 'nft-checkout-payment-gateway');
-			}
+		if (!$order instanceof WC_Order) {
+			global $theorder;
+			$order = $theorder;
+		}
+		if ($order instanceof WC_Order && nft_checkout_is_gateway_order($order)) {
+			$actions['nft_checkout_check_status'] = __('Check this card payment with RT', 'nft-checkout-payment-gateway');
 		}
 		return $actions;
 	}
 
 	/**
-	 * Handle manual status check action from order screen.
+	 * Handle manual status check action from order screen (admin-initiated,
+	 * so this one call to RT is synchronous).
 	 *
 	 * @param WC_Order $order
 	 */
 	public function nft_checkout_process_order_action_check_status($order)
 	{
-		if ($order instanceof WC_Order) {
-			$method = $order->get_payment_method();
-			if ($method === 'nft-checkout' || $method === 'nft_checkout') {
-				$result = $this->sync_single_order_status($order);
-				if ($result === 'success') {
-					$order->add_order_note(__('Manual status check: Payment confirmed successfully.', 'nft-checkout-payment-gateway'));
-				} elseif ($result) {
-					$order->add_order_note(sprintf(__('Manual status check: Status is %s.', 'nft-checkout-payment-gateway'), $result));
-				} else {
-					$order->add_order_note(__('Manual status check: No status update available.', 'nft-checkout-payment-gateway'));
-				}
-			}
+		if (!$order instanceof WC_Order || !nft_checkout_is_gateway_order($order)) {
+			return;
+		}
+
+		$result = $this->sync_single_order_status($order);
+		if ($result === 'success') {
+			$order->add_order_note(__('Checked with RT: the customer has paid.', 'nft-checkout-payment-gateway'));
+		} elseif ($result) {
+			$order->add_order_note(nft_checkout_plain_status_sentence($result));
+		} else {
+			$order->add_order_note(__('Checked with RT: the customer has not paid yet.', 'nft-checkout-payment-gateway'));
 		}
 	}
 
 	/**
-	 * Auto-sync pending orders when admin views the Orders screen.
+	 * Queue a refresh of the open orders when an admin loads the Orders list
+	 * (throttled; nothing is fetched during the render).
 	 *
 	 * @param WP_Screen|null $screen
 	 */
 	public function nft_checkout_admin_orders_screen_sync($screen = null)
 	{
-		if (!is_admin()) {
+		if (!is_admin() || !current_user_can('manage_woocommerce')) {
 			return;
 		}
 		$screen_id = is_object($screen) ? ($screen->id ?? '') : '';
-		$page      = isset($_GET['page']) ? sanitize_text_field($_GET['page']) : '';
-		$post_type = isset($_GET['post_type']) ? sanitize_text_field($_GET['post_type']) : '';
+		// phpcs:disable WordPress.Security.NonceVerification.Recommended
+		$page      = isset($_GET['page']) ? sanitize_text_field(wp_unslash($_GET['page'])) : '';
+		$post_type = isset($_GET['post_type']) ? sanitize_text_field(wp_unslash($_GET['post_type'])) : '';
+		$edit_id   = isset($_GET['id']) ? absint($_GET['id']) : (isset($_GET['post']) ? absint($_GET['post']) : 0);
+		// phpcs:enable WordPress.Security.NonceVerification.Recommended
+
+		if ($edit_id > 0 && ($page === 'wc-orders' || $post_type === 'shop_order')) {
+			$edit_order = wc_get_order($edit_id);
+			if ($edit_order instanceof WC_Order) {
+				$this->nft_checkout_admin_order_sync_on_view($edit_order);
+			}
+			return;
+		}
 
 		$is_orders_screen = in_array($screen_id, ['shop_order', 'woocommerce_page_wc-orders', 'edit-shop_order'], true)
 			|| $page === 'wc-orders'
-			|| ($post_type === 'shop_order');
+			|| $post_type === 'shop_order';
 
-		if ($is_orders_screen) {
-			$last_screen_sync = (int) get_transient('nft_checkout_last_orders_screen_sync');
-			if (time() - $last_screen_sync >= 10) {
-				set_transient('nft_checkout_last_orders_screen_sync', time(), 30);
-				$this->sync_pending_orders(10);
+		if (!$is_orders_screen) {
+			return;
+		}
+
+		$last_screen_sync = (int) get_transient('rt_nft_checkout_last_orders_screen_sync');
+		if (time() - $last_screen_sync < 60) {
+			return;
+		}
+		set_transient('rt_nft_checkout_last_orders_screen_sync', time(), 120);
+
+		foreach (nft_checkout_gateway_ids() as $gateway_id) {
+			$orders = wc_get_orders([
+				'status'         => ['pending', 'on-hold'],
+				'payment_method' => $gateway_id,
+				'limit'          => 20,
+				'orderby'        => 'date',
+				'order'          => 'DESC',
+				'return'         => 'ids',
+			]);
+			foreach ((array) $orders as $order_id) {
+				$this->nft_checkout_schedule_async_sync($order_id);
 			}
 		}
 	}
 
 	/**
-	 * Auto-sync pending orders during HPOS orders table row rendering.
-	 */
-	public function nft_checkout_admin_order_row_filter($classes, $order)
-	{
-		if (!$order instanceof WC_Order) {
-			return $classes;
-		}
-		$method = $order->get_payment_method();
-		if (($method === 'nft-checkout' || $method === 'nft_checkout') && $order->has_status(['pending', 'on-hold'])) {
-			$last_sync = (int) $order->get_meta('_nft_checkout_last_row_sync');
-			if (time() - $last_sync >= 10) {
-				$order->update_meta_data('_nft_checkout_last_row_sync', time());
-				$order->save();
-				$this->sync_single_order_status($order);
-			}
-		}
-		return $classes;
-	}
-
-	/**
-	 * Auto-sync pending orders during Classic posts orders table row rendering.
-	 */
-	public function nft_checkout_admin_post_class_filter($classes, $class, $post_id)
-	{
-		if (is_admin() && get_post_type($post_id) === 'shop_order') {
-			$order = wc_get_order($post_id);
-			if ($order instanceof WC_Order) {
-				$method = $order->get_payment_method();
-				if (($method === 'nft-checkout' || $method === 'nft_checkout') && $order->has_status(['pending', 'on-hold'])) {
-					$last_sync = (int) $order->get_meta('_nft_checkout_last_row_sync');
-					if (time() - $last_sync >= 10) {
-						$order->update_meta_data('_nft_checkout_last_row_sync', time());
-						$order->save();
-						$this->sync_single_order_status($order);
-					}
-				}
-			}
-		}
-		return $classes;
-	}
-
-	/**
-	 * Auto-sync a pending order row when rendered in HPOS orders table.
-	 *
-	 * @param string $column
-	 * @param WC_Order $order
-	 */
-	public function nft_checkout_admin_order_row_sync($column, $order)
-	{
-		if ($column !== 'order_status' && $column !== 'order_number') {
-			return;
-		}
-		if (!$order instanceof WC_Order) {
-			return;
-		}
-		$method = $order->get_payment_method();
-		if ($method !== 'nft-checkout' && $method !== 'nft_checkout') {
-			return;
-		}
-		if (!$order->has_status(['pending', 'on-hold'])) {
-			return;
-		}
-		$last_sync = (int) $order->get_meta('_nft_checkout_last_row_sync');
-		if (time() - $last_sync < 20) {
-			return;
-		}
-		$order->update_meta_data('_nft_checkout_last_row_sync', time());
-		$order->save();
-		$this->sync_single_order_status($order);
-	}
-
-	/**
-	 * Auto-sync a pending order row when rendered in Classic posts orders table.
-	 *
-	 * @param string $column
-	 * @param int $post_id
-	 */
-	public function nft_checkout_admin_order_row_sync_posts($column, $post_id)
-	{
-		if ($column !== 'order_status' && $column !== 'order_number') {
-			return;
-		}
-		$order = wc_get_order($post_id);
-		if ($order) {
-			$this->nft_checkout_admin_order_row_sync($column, $order);
-		}
-	}
-
-	/**
-	 * Auto-sync when customer visits the order confirmation or account view order page.
+	 * One throttled check when the customer lands on the order-received page or
+	 * views the order in My Account.
 	 *
 	 * @param int $order_id
 	 */
 	public function nft_checkout_customer_order_sync($order_id)
 	{
 		$order = wc_get_order($order_id);
-		if ($order instanceof WC_Order) {
-			$method = $order->get_payment_method();
-			if (($method === 'nft-checkout' || $method === 'nft_checkout') && $order->has_status(['pending', 'on-hold'])) {
-				$this->sync_single_order_status($order);
-			}
+		if (!$order instanceof WC_Order || !nft_checkout_is_gateway_order($order)) {
+			return;
 		}
+		if (!$order->has_status(['pending', 'on-hold'])) {
+			return;
+		}
+		$last_sync = (int) $order->get_meta('_nft_checkout_last_customer_sync');
+		if (time() - $last_sync < 15) {
+			return;
+		}
+		$order->update_meta_data('_nft_checkout_last_customer_sync', time());
+		$order->save();
+
+		$this->sync_single_order_status($order);
 	}
 }

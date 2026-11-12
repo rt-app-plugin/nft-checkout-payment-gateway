@@ -1,6 +1,24 @@
 <?php
 if (!defined('ABSPATH')) exit;
 
+require_once plugin_dir_path(__FILE__) . 'config.php';
+require_once plugin_dir_path(__FILE__) . 'nft-checkout-payment-gateway-utils.php';
+
+/**
+ * The order's payment state machine.
+ *
+ * States: pending (voucher sent, nothing paid), processing (a payment is in
+ * flight), success (paid: WooCommerce processing / completed), failed,
+ * cancelled, expired.
+ *
+ * NFT-07: success is final. Nothing - no webhook, no sync, no return link -
+ * moves a paid order down again. An order paid another way (its WooCommerce
+ * status is processing or completed) counts as success too. A "returned"
+ * notice from RT on a paid order is recorded and the merchant told; the
+ * status is left for a human.
+ *
+ * NFT-08: every event is deduplicated, whatever its source.
+ */
 class NFT_Checkout_Payment_State_Engine
 {
     const LOCK_TTL  = 12;
@@ -14,10 +32,9 @@ class NFT_Checkout_Payment_State_Engine
         $order = wc_get_order($order_id);
         if (!$order) return false;
 
-        $payment_method = $order->get_payment_method();
-        if ($payment_method !== 'nft-checkout' && $payment_method !== 'nft_checkout') {
+        if (!nft_checkout_is_gateway_order($order)) {
             NFT_Checkout_Payment_Gateway_Logger::warning(
-                "Refused state transition for non-nft-checkout order #{$order_id} (payment method: {$payment_method})",
+                "Refused state transition for non-nft-checkout order #{$order_id} (payment method: " . $order->get_payment_method() . ')',
                 ['source' => 'nft-checkout-payment-gateway']
             );
             return false;
@@ -25,19 +42,20 @@ class NFT_Checkout_Payment_State_Engine
 
         $event_id = self::generate_event_id($event_type, $payload);
 
-        if ($event_type === 'api_update' && self::is_duplicate_event($order_id, $event_id)) {
+        // NFT-08: a repeat of an event that already reached the order is ignored,
+        // whichever path delivered it.
+        if (self::is_duplicate_event($order_id, $event_id)) {
             return self::safe_response($order, 'duplicate_event_ignored', self::get_state($order));
         }
 
-        self::mark_event($order_id, $event_id);
-
-        $lock_key = "nft_checkout_lock_{$order_id}";
+        $lock_key = "rt_nft_checkout_lock_{$order_id}";
         $lock_acquired = add_option($lock_key, time() + self::LOCK_TTL, '', 'no');
         if (!$lock_acquired) {
             $lock_time = (int) get_option($lock_key);
             if ($lock_time > 0 && $lock_time < time()) {
                 update_option($lock_key, time() + self::LOCK_TTL, false);
             } else {
+                // Not marked as seen: the sender may retry once the lock is gone.
                 return self::safe_response($order, 'locked_skip');
             }
         }
@@ -52,20 +70,35 @@ class NFT_Checkout_Payment_State_Engine
             }
 
             if ($current_state === 'success') {
+                if ($new_state === 'returned' && in_array($event_type, ['webhook_update'], true)) {
+                    // Money that arrived was sent back. Recorded for the merchant;
+                    // the order status is never changed automatically (NFT-07).
+                    self::record_return($order, $payload, $event_type);
+                    self::mark_event($order_id, $event_id);
+                    return self::safe_response($order, 'return_recorded', 'success');
+                }
                 return self::safe_response($order, 'final_success_locked', 'success');
             }
 
-            // ONLY apply state change (NO NOTES HERE)
+            if ($new_state === 'returned') {
+                // A return only makes sense for money that arrived.
+                return self::safe_response($order, 'invalid_transition_blocked', $current_state);
+            }
+
             $can_transition = self::can_transition($current_state, $new_state);
 
             /**
-             * NFT-09: Allow success only from pending, failed or processing
+             * A verified payment must always be able to settle an order that is
+             * still waiting for money, whatever closed attempt the engine last
+             * recorded.
              */
             if ($new_state === 'success') {
-                if (in_array($current_state, ['pending', 'failed', 'processing', 'on-hold', 'checkout-draft'], true)) {
-                    $can_transition = true;
-                } else {
-                    $can_transition = false;
+                $can_transition = in_array(
+                    $current_state,
+                    ['pending', 'on-hold', 'checkout-draft', 'processing', 'failed', 'cancelled', 'expired'],
+                    true
+                );
+                if (!$can_transition) {
                     NFT_Checkout_Payment_Gateway_Logger::warning(
                         "Refused state transition to success for order #{$order_id} from state '{$current_state}'",
                         ['source' => 'nft-checkout-payment-gateway']
@@ -73,9 +106,6 @@ class NFT_Checkout_Payment_State_Engine
                 }
             }
 
-            /**
-             * BLOCK invalid transitions
-             */
             if (!$can_transition) {
                 NFT_Checkout_Payment_Gateway_Logger::warning(
                     "Invalid transition blocked for order #{$order_id}: {$current_state} -> {$new_state}",
@@ -88,14 +118,9 @@ class NFT_Checkout_Payment_State_Engine
                 );
             }
 
-            /**
-             * APPLY STATE
-             */
             self::apply($order, $new_state, $event_type, $payload);
+            self::mark_event($order_id, $event_id);
 
-            /**
-             * PUSH TIMELINE
-             */
             if ($new_state === 'failed') {
 
                 $existing = self::timeline_has_state_for_token(
@@ -105,22 +130,13 @@ class NFT_Checkout_Payment_State_Engine
                 );
 
                 if (!$existing) {
-                    self::push_timeline_event(
-                        $order,
-                        $new_state,
-                        $event_type,
-                        $payload
-                    );
+                    self::push_timeline_event($order, $new_state, $event_type, $payload);
                 }
 
+            } elseif ($new_state === 'pending' && $current_state === 'pending') {
+                // Nothing happened; keep the timeline readable.
             } else {
-
-                self::push_timeline_event(
-                    $order,
-                    $new_state,
-                    $event_type,
-                    $payload
-                );
+                self::push_timeline_event($order, $new_state, $event_type, $payload);
             }
 
             // SINGLE SOURCE OF TRUTH FOR NOTES
@@ -139,10 +155,7 @@ class NFT_Checkout_Payment_State_Engine
             return false;
         }
 
-        $timeline = self::get_timeline($order);
-
-        foreach ($timeline as $event) {
-
+        foreach (self::get_timeline($order) as $event) {
             if (
                 ($event['type'] ?? '') === $state &&
                 ($event['payment_token'] ?? '') === $payment_token
@@ -189,7 +202,13 @@ class NFT_Checkout_Payment_State_Engine
 
         $last_lock = $order->get_meta('_nft_checkout_state_lock');
 
-        if ($last_lock === $state_lock_key && !($state === 'success' && $order->has_status(['pending', 'on-hold', 'failed']))) {
+        // The lock only short-circuits a repeat of an event that already reached
+        // WooCommerce. A 'success' lock on an order that is still unpaid means the
+        // earlier attempt never completed, so it must be allowed through again.
+        if (
+            $last_lock === $state_lock_key &&
+            !($state === 'success' && $order->has_status(['pending', 'on-hold', 'failed', 'cancelled', 'checkout-draft']))
+        ) {
             return;
         }
 
@@ -205,8 +224,11 @@ class NFT_Checkout_Payment_State_Engine
 
         if ($wc_status) {
             if ($state === 'success') {
+                // payment_complete() records the transaction id and paid date,
+                // reduces stock and moves the order to processing/completed the
+                // WooCommerce way. Then honour the configured success status.
                 $order->payment_complete($payment_token);
-                if ($wc_status && $order->get_status() !== $wc_status) {
+                if ($order->get_status() !== $wc_status) {
                     $order->update_status($wc_status, '');
                 }
             } else {
@@ -230,19 +252,63 @@ class NFT_Checkout_Payment_State_Engine
         $order->save();
     }
 
+    /**
+     * RT reports that money which had arrived was sent back (a return, a
+     * reversal, a chargeback). The order stays as it is (NFT-07); the merchant
+     * gets a note and an e-mail and decides.
+     */
+    private static function record_return($order, $payload, $event_type)
+    {
+        $return_code = sanitize_text_field((string) ($payload['return_code'] ?? ''));
+        $reason      = sanitize_text_field((string) ($payload['failure_reason'] ?? ''));
+        $token       = sanitize_text_field((string) ($payload['payment_token'] ?? ''));
+
+        if ($order->get_meta('_nft_checkout_payment_returned') === 'yes') {
+            return;
+        }
+
+        /* translators: %s: reference code for the reversal */
+        $detail = $return_code !== '' ? sprintf(__(' (reference %s)', 'nft-checkout-payment-gateway'), $return_code) : '';
+        $note   = sprintf(
+            /* translators: %1$s: bank or card reference in parentheses, or empty */
+            __('This card payment was reversed after it had been received%1$s. The money is no longer in your RT account. The order was not changed: check it before shipping.', 'nft-checkout-payment-gateway'),
+            $detail
+        );
+        if ($reason !== '') {
+            $note .= ' ' . $reason;
+        }
+
+        $order->update_meta_data('_nft_checkout_payment_returned', 'yes');
+        $order->update_meta_data('_nft_checkout_return_code', $return_code);
+        $order->update_meta_data('_nft_checkout_returned_at', current_time('mysql'));
+        $order->add_order_note('<strong>NFT Checkout</strong><br><br>' . esc_html($note));
+        $order->save();
+
+        $to = apply_filters('rt_nft_checkout_alert_email', get_option('admin_email'), $order);
+        if (!empty($to) && is_email($to)) {
+            wp_mail(
+                $to,
+                sprintf(
+                    /* translators: 1: site name, 2: order number */
+                    __('[%1$s] Payment returned for order #%2$s', 'nft-checkout-payment-gateway'),
+                    wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES),
+                    $order->get_order_number()
+                ),
+                $note . "\n\n" . $order->get_edit_order_url()
+            );
+        }
+
+        NFT_Checkout_Payment_Gateway_Logger::warning(
+            "Payment returned reported for paid order #{$order->get_id()} (not applied automatically).",
+            ['event_type' => $event_type, 'return_code' => $return_code]
+        );
+    }
+
     private static function get_timeline($order)
     {
         $data = $order->get_meta('_nft_checkout_timeline', true);
-        if (empty($data)) {
-            $data = $order->get_meta('_nft_checkout_timeline', true);
-        }
 
-        if (empty($data)) {
-            return [];
-        }
-
-        // If corrupted string
-        if (!is_array($data)) {
+        if (empty($data) || !is_array($data)) {
             return [];
         }
 
@@ -268,54 +334,28 @@ class NFT_Checkout_Payment_State_Engine
         $cancel_event  = null;
         $seen_failed   = [];
 
-        /**
-         * SINGLE PASS TIMELINE PARSE
-         */
         foreach ($timeline as $event) {
 
             $type  = $event['type'] ?? '';
             $token = trim((string) ($event['payment_token'] ?? ''));
 
-            /**
-             * FAILED EVENTS
-             */
             if ($type === 'failed') {
-
-                if (
-                    !empty($token) &&
-                    !isset($seen_failed[$token])
-                ) {
+                if (!empty($token) && !isset($seen_failed[$token])) {
                     $seen_failed[$token] = true;
-
                     $failed_events[] = $event;
                 }
             }
 
-            /**
-             * SUCCESS EVENT
-             */
-            if (
-                $type === 'success' &&
-                !$success_event
-            ) {
+            if ($type === 'success' && !$success_event) {
                 $success_event = $event;
             }
 
-            /**
-             * CANCEL EVENT
-             */
-            if (
-                $type === 'cancelled' &&
-                !$cancel_event
-            ) {
+            if ($type === 'cancelled' && !$cancel_event) {
                 $cancel_event = $event;
             }
         }
 
-        /**
-         * FAILED NOTES
-         */
-        $already_synced = (int) ($order->get_meta('_nft_checkout_failed_note_count') ?: $order->get_meta('_nft_checkout_failed_note_count'));
+        $already_synced = (int) $order->get_meta('_nft_checkout_failed_note_count');
 
         $actual_failed_count = count($failed_events);
 
@@ -336,20 +376,10 @@ class NFT_Checkout_Payment_State_Engine
                 );
             }
 
-            $order->update_meta_data(
-                '_nft_checkout_failed_note_count',
-                $actual_failed_count
-            );
+            $order->update_meta_data('_nft_checkout_failed_note_count', $actual_failed_count);
         }
 
-        /**
-         * SUCCESS NOTE
-         */
-        if (
-            $success_event &&
-            !$order->get_meta('_nft_checkout_success_note_added') &&
-            !$order->get_meta('_nft_checkout_success_note_added')
-        ) {
+        if ($success_event && !$order->get_meta('_nft_checkout_success_note_added')) {
 
             $order->add_order_note(
                 self::build_order_note(
@@ -359,20 +389,10 @@ class NFT_Checkout_Payment_State_Engine
                 )
             );
 
-            $order->update_meta_data(
-                '_nft_checkout_success_note_added',
-                'yes'
-            );
+            $order->update_meta_data('_nft_checkout_success_note_added', 'yes');
         }
 
-        /**
-         * CANCEL NOTE
-         */
-        if (
-            $cancel_event &&
-            !$order->get_meta('_nft_checkout_cancel_note_added') &&
-            !$order->get_meta('_nft_checkout_cancel_note_added')
-        ) {
+        if ($cancel_event && !$order->get_meta('_nft_checkout_cancel_note_added')) {
 
             $order->add_order_note(
                 self::build_order_note(
@@ -382,37 +402,31 @@ class NFT_Checkout_Payment_State_Engine
                 )
             );
 
-            $order->update_meta_data(
-                '_nft_checkout_cancel_note_added',
-                'yes'
-            );
+            $order->update_meta_data('_nft_checkout_cancel_note_added', 'yes');
         }
 
         $order->save();
     }
 
-    private static function build_order_note(
-        $title,
-        $payment_token,
-        $event_type
-    ) {
-
+    private static function build_order_note($title, $payment_token, $event_type)
+    {
         $source = match ($event_type) {
             'popup_close'    => 'Customer Return from Payment Page',
             'redirect'       => 'Customer Redirect',
             'webhook_update' => 'Webhook',
+            'api_sync'       => 'Status Check',
             default          => 'System'
         };
 
         // Decode Base64 payment token if possible
-        $decoded_payment_id = base64_decode($payment_token, true);
+        $decoded_payment_id = base64_decode((string) $payment_token, true);
 
-        if (empty($decoded_payment_id)) {
+        if (empty($decoded_payment_id) || !ctype_print($decoded_payment_id)) {
             $decoded_payment_id = $payment_token;
         }
 
         return sprintf(
-            '<strong>Voucher Pay</strong><br><br>
+            '<strong>NFT Checkout</strong><br><br>
             <strong>%s</strong><br><br>
             <strong>Payment ID:</strong> %s<br>
             <strong>Updated Via:</strong> %s<br>
@@ -427,6 +441,26 @@ class NFT_Checkout_Payment_State_Engine
     /* =========================================================
      * STATE RESOLUTION
      * ========================================================= */
+
+    /**
+     * Map a status word RT uses to the engine vocabulary, or null.
+     */
+    public static function map_status($status)
+    {
+        $status = is_string($status) && $status !== '' ? strtolower(trim($status)) : null;
+
+        return match ($status) {
+            'success', 'paid', 'completed', 'settled', 'succeeded' => 'success',
+            'failed', 'rejected', 'declined'                        => 'failed',
+            'cancelled', 'canceled'                                 => 'cancelled',
+            'expired'                                               => 'expired',
+            'processing', 'in_flight', 'in-flight', 'authorized', 'authorised' => 'processing',
+            'pending', 'initiated', 'created', 'open', 'awaiting'   => 'pending',
+            'returned', 'reversed', 'reversal', 'chargeback', 'charged_back', 'disputed', 'refunded', 'refund' => 'returned',
+            default                                                 => null
+        };
+    }
+
     private static function resolve_state($payload)
     {
         $status = $payload['status']
@@ -435,16 +469,7 @@ class NFT_Checkout_Payment_State_Engine
             ?? $payload['order_status']
             ?? null;
 
-        $status = $status ? strtolower((string)$status) : null;
-
-        return match ($status) {
-            'success', 'paid', 'completed'  => 'success',
-            'failed'                        => 'failed',
-            'cancelled', 'canceled'        => 'cancelled',
-            'expired'                      => 'expired',
-            'pending', 'processing'        => 'processing',
-            default                        => null
-        };
+        return self::map_status($status);
     }
 
     /* =========================================================
@@ -468,13 +493,13 @@ class NFT_Checkout_Payment_State_Engine
         if ($from === $to) return true;
 
         $map = [
-            'pending'        => ['pending', 'cancelled', 'processing', 'success', 'failed', 'on-hold'],
-            'on-hold'        => ['pending', 'cancelled', 'processing', 'success', 'failed', 'on-hold'],
-            'checkout-draft' => ['pending', 'cancelled', 'processing', 'success', 'failed', 'on-hold'],
-            'processing' => ['processing', 'success', 'failed', 'cancelled'],
-            'failed'     => ['failed', 'success', 'processing', 'cancelled', 'pending'],
-            'cancelled'  => ['cancelled', 'failed', 'processing', 'success', 'pending'],
-            'expired'    => ['expired', 'pending', 'failed', 'cancelled', 'processing', 'success'],
+            'pending'        => ['pending', 'cancelled', 'processing', 'success', 'failed', 'expired', 'on-hold'],
+            'on-hold'        => ['pending', 'cancelled', 'processing', 'success', 'failed', 'expired', 'on-hold'],
+            'checkout-draft' => ['pending', 'cancelled', 'processing', 'success', 'failed', 'expired', 'on-hold'],
+            'processing'     => ['processing', 'success', 'failed', 'cancelled', 'expired'],
+            'failed'         => ['failed', 'success', 'processing', 'cancelled', 'expired', 'pending'],
+            'cancelled'      => ['cancelled', 'failed', 'processing', 'success', 'pending'],
+            'expired'        => ['expired', 'pending', 'failed', 'cancelled', 'processing', 'success'],
         ];
 
         return in_array($to, $map[$from] ?? [], true);
@@ -486,13 +511,22 @@ class NFT_Checkout_Payment_State_Engine
     private static function get_state($order)
     {
         $wc_status = $order->get_status();
+
+        // NFT-07: a paid order is paid, whatever this plugin last recorded and
+        // however it was paid. Nothing may move it down again.
+        if (in_array($wc_status, ['processing', 'completed'], true) || $order->is_paid()) {
+            return 'success';
+        }
+
         if ($wc_status === 'cancelled') {
             return 'cancelled';
         }
+
         $meta_state = $order->get_meta('_nft_checkout_state');
         if (!empty($meta_state)) {
             return $meta_state;
         }
+
         return !empty($wc_status) ? $wc_status : 'pending';
     }
 
@@ -501,11 +535,8 @@ class NFT_Checkout_Payment_State_Engine
      * ========================================================= */
     private static function get_success_wc_status()
     {
-        $settings = get_option('woocommerce_nft-checkout_settings', []);
-        if (empty($settings)) {
-            $settings = get_option('woocommerce_nft_checkout_settings', []);
-        }
-        $status = $settings['order_status'] ?? 'processing';
+        $settings = nft_checkout_get_settings();
+        $status   = $settings['order_status'] ?? 'processing';
 
         return in_array($status, ['processing','completed'], true)
             ? $status
@@ -513,25 +544,26 @@ class NFT_Checkout_Payment_State_Engine
     }
 
     /* =========================================================
-     * EVENT ID (webhook dedupe only)
+     * EVENT ID (dedupe for every event type)
      * ========================================================= */
     private static function generate_event_id($type, $payload)
     {
         return hash('sha256', implode('|', [
             $type,
-            $payload['status'] ?? '',
-            $payload['payment_token'] ?? ''
+            strtolower((string) ($payload['status'] ?? '')),
+            $payload['payment_token'] ?? '',
+            $payload['return_code'] ?? '',
         ]));
     }
 
     private static function is_duplicate_event($order_id, $event_id)
     {
-        return get_transient("nft_checkout_event_{$order_id}_{$event_id}") !== false;
+        return get_transient("rt_nft_checkout_event_{$order_id}_{$event_id}") !== false;
     }
 
     private static function mark_event($order_id, $event_id)
     {
-        set_transient("nft_checkout_event_{$order_id}_{$event_id}", 1, self::EVENT_TTL);
+        set_transient("rt_nft_checkout_event_{$order_id}_{$event_id}", 1, self::EVENT_TTL);
     }
 
     /* =========================================================
@@ -550,22 +582,15 @@ class NFT_Checkout_Payment_State_Engine
     public static function resolve_final_state($order, $api_status = null)
     {
         // 1. PRIMARY: engine state (validated)
-        $state = self::get_state($order);
+        $state = self::normalize_state(self::get_state($order));
 
         if (!empty($state) && in_array($state, ['pending','processing','success','failed','cancelled','expired'], true)) {
             return $state;
         }
 
         // 2. SAFETY: API status (current response)
-        if (!empty($api_status)) {
-            $mapped = match (strtolower((string)$api_status)) {
-                'success', 'paid', 'completed' => 'success',
-                'failed' => 'failed',
-                'cancelled', 'canceled' => 'cancelled',
-                'processing', 'pending' => 'processing',
-                default => null
-            };
-
+        if (!empty($api_status) && is_string($api_status)) {
+            $mapped = self::map_status($api_status);
             if ($mapped) {
                 return $mapped;
             }

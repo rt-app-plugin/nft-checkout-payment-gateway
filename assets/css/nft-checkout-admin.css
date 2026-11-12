@@ -162,22 +162,55 @@
 	color: #fff;
 }
 
-.status-label.active,
+/* Green only when RT has accepted the keys. */
+.status-label,
 .account-status-label {
-	background-color: #28a745;
+	background-color: #646970;
+}
+
+.status-label.active,
+.account-status-label.active {
+	background-color: #1a7f37;
+}
+
+.account-status-label.pending {
+	background-color: #9a6700;
 }
 
 .status-label.inactive,
 .status-label.invalid,
-.status-label.service-unavailable,
-.status-label.unavailable,
-.account-status-label.inactive,
 .account-status-label.invalid,
-.account-status-label.service-unavailable,
-.account-status-label.service_unavailable,
-.account-status-label.unavailable,
-.account-status-label.unknown {
-	background-color: #dc3545;
+.account-status-label.not-connected {
+	background-color: #b32d2e;
+}
+
+.nft-checkout-accounts-container .error-message,
+.nft-checkout-gateway-settings-form .error-message {
+	color: #b32d2e;
+	margin-top: 4px;
+}
+
+.nft-checkout-sync-account .error {
+	color: #b32d2e;
+}
+
+.nft-checkout-sync-account .success {
+	color: #1a7f37;
+}
+
+@media (max-width: 600px) {
+	.nft-checkout-accounts-container .title-blog,
+	.nft-checkout-accounts-container .action-button {
+		flex-wrap: wrap;
+		gap: 6px;
+	}
+	.nft-checkout-accounts-container .account-input,
+	.nft-checkout-accounts-container .account-input input,
+	.nft-checkout-accounts-container .account-input textarea {
+		width: 100%;
+		max-width: 100%;
+		box-sizing: border-box;
+	}
 }
 
 #nft-checkout-sync-status {
